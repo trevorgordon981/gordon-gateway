@@ -1,0 +1,122 @@
+# gordon-gateway config.example.yaml
+# -----------------------------------------------------------------------------
+# Copy to ~/gordon-gateway/config.yaml and edit, OR omit the file entirely and
+# set the equivalent environment variables (every key below has an env override;
+# env always WINS over YAML). If PyYAML is not installed the file is ignored and
+# pure-env config is used. Secrets (MASTER_KEY, OPENROUTER_API_KEY) should come
+# from env / the launchd plist, NOT this file.
+#
+# Two modes. Pick ONE per process:
+#   mode: alfred   -> studio: routing + model selection + Anthropic xlate + OTLP
+#   mode: walter   -> laptop: blockops tool-call xlate + loop guards + OTLP
+# -----------------------------------------------------------------------------
+
+# ======== COMMON (both modes) ========
+mode: alfred                       # env GATEWAY_MODE   ("alfred" | "walter")
+host: 127.0.0.1                    # env HOST
+# port:                            # env PORT   (default 8091 alfred / 8080 walter)
+
+# ---- tracing / metrics (applies in BOTH modes) ----
+tracing_enabled: true             # env TRACING_ENABLED
+otel_endpoint: "http://127.0.0.1:4317"   # env OTEL_ENDPOINT (otel-collector gRPC)
+trace_content: true               # env TRACE_CONTENT  (false = no prompt/completion span events)
+service_name: "llm-gateway"       # env OTEL_SERVICE_NAME  (metrics-proxy used "llm-metrics-proxy")
+primary_user_id: "U0ABVDL7C9M"    # env PRIMARY_USER_ID  (Slack id -> user_class=primary)
+sonnet_input_price: 3.0           # env SONNET_INPUT_PRICE   ($/1M input tok, Sonnet-equivalent cost)
+sonnet_output_price: 15.0         # env SONNET_OUTPUT_PRICE  ($/1M output tok)
+# metrics_state_file:             # env METRICS_STATE_FILE  (default ~/gordon-gateway/metrics_state.json)
+# metrics_state_save_interval: 30 # env METRICS_STATE_SAVE_INTERVAL
+
+# log_file:                       # env LOG_FILE   (default ~/.hermes/logs/gateway.log; rotating)
+
+# ======== ALFRED MODE ONLY ========
+# master_key: ...                 # env MASTER_KEY  (REQUIRED in alfred mode; keep in plist, not here)
+# max_body_bytes: 52428800        # env MAX_BODY_BYTES
+
+# Backend routing table. If omitted, the built-in default table (identical to
+# the old alfred-llm-proxy proxy.py) is used. To override, list backends here.
+# api_key may be a literal or "env:VARNAME" to read from the environment.
+# backends:
+#   - name: qwen-397b
+#     base_url: "http://127.0.0.1:8090/v1"   # NOTE: 8090 = the tracing layer, see cutover notes
+#     upstream_model: "/Users/alfredpennyworth/models/qwen3.5-397b-6bit"
+#     api_key: "not-needed"
+#   - name: kimi-k2.6
+#     base_url: "http://127.0.0.1:8082/v1"
+#     upstream_model: "kimi-k2.6"
+#     api_key: "not-needed"
+#   - name: glm-5.1
+#     base_url: "http://127.0.0.1:8082/v1"
+#     upstream_model: "glm-5.1"
+#     api_key: "not-needed"
+#   - name: glm-5.1-test
+#     base_url: "http://127.0.0.1:8083/v1"
+#     upstream_model: "glm-5.1"
+#     api_key: "not-needed"
+#   - name: qwen-alfred-router
+#     base_url: "http://spark-d10b:9003/v1"
+#     upstream_model: "qwen-alfred-router"
+#     api_key: "not-needed"
+#   - name: openrouter-free
+#     base_url: "https://openrouter.ai/api/v1"
+#     upstream_model: "nvidia/nemotron-3-super-120b-a12b:free"
+#     api_key: "env:OPENROUTER_API_KEY"
+#     extra_headers:
+#       HTTP-Referer: "http://100.92.88.67"
+#       X-Title: "Alfred-Backup"
+
+# Fallback chains: requested model -> ordered list of fallback backend names.
+# fallbacks:
+#   qwen-397b: ["openrouter-free"]
+#   qwen-alfred-router: ["openrouter-free"]
+
+# ======== WALTER MODE ONLY ========
+walter_backend: "http://127.0.0.1:8082"   # env BACKEND_URL  (the local LLM server)
+backend_strip_path_prefix: ""             # env BACKEND_STRIP_PATH_PREFIX  (e.g. "/v1")
+model_name: ""                            # env MODEL_NAME    (session-banner display name)
+
+# Canonical model path. An unknown/missing `model` field is coerced to this by
+# normalize_upstream_model() so the upstream mlx-vlm server does NOT cache-clear
+# / cold-reload on an unrecognized id. This is the value the studio's ~8 default
+# aliases all point at; override if Walter serves a different local model.
+walter_canonical_model: "/Users/alfredpennyworth/models/qwen3.5-122b-a10b-8bit"   # env WALTER_CANONICAL_MODEL
+
+# Per-role backend URLs (studio parity). Default to walter_backend, so on a
+# single-server laptop everything stays on one backend. Point these at separate
+# mlx servers (e.g. :8083 / :8084) only on a multi-backend host.
+coder_backend: "http://127.0.0.1:8082"    # env CODER_BACKEND   (coder / qwen-coder aliases)
+reason_backend: "http://127.0.0.1:8082"   # env REASON_BACKEND  (reason / qwen-reason / r1 aliases)
+
+# Alias -> upstream model-path map, and per-model backend overrides.
+# If OMITTED, the studio defaults apply (~8 aliases incl. coder/reason/r1, all
+# -> walter_canonical_model; per-role backends from coder_backend/reason_backend).
+# Provide an explicit EMPTY map ({}) to force pure pass-through with NO aliasing
+# (matches the public/laptop blockops-proxy.py, where normalize_upstream_model is
+# a no-op). Any non-empty map you supply WINS over the studio defaults.
+# model_aliases:
+#   qwen35:       "/Users/alfredpennyworth/models/qwen3.5-122b-a10b-8bit"
+#   coder:        "/Users/alfredpennyworth/models/qwen3.5-122b-a10b-8bit"
+#   reason:       "/Users/alfredpennyworth/models/qwen3.5-122b-a10b-8bit"
+#   r1:           "/Users/alfredpennyworth/models/qwen3.5-122b-a10b-8bit"
+# model_backends:
+#   coder:  "http://127.0.0.1:8083"
+#   reason: "http://127.0.0.1:8084"
+#   r1:     "http://127.0.0.1:8084"
+
+# ---- blockops tuning (all have env overrides of the same UPPER_SNAKE name) ----
+heartbeat_interval: 5                  # HEARTBEAT_INTERVAL
+max_messages: 300                      # MAX_MESSAGES
+max_concurrent: 3                      # MAX_CONCURRENT  (per-backend in-flight cap)
+loop_nudge_threshold: 4                # LOOP_NUDGE_THRESHOLD
+loop_stop_threshold: 8                 # LOOP_STOP_THRESHOLD
+loop_cycle_nudge_reps: 3               # LOOP_CYCLE_NUDGE_REPS
+loop_cycle_stop_reps: 4                # LOOP_CYCLE_STOP_REPS
+loop_cycle_max_len: 4                  # LOOP_CYCLE_MAX_LEN
+loop_session_nudge_limit: 8            # LOOP_SESSION_NUDGE_LIMIT
+repeat_parse_error_stop: 2             # REPEAT_PARSE_ERROR_STOP
+tool_result_compression_threshold: 15000   # TOOL_RESULT_COMPRESSION_THRESHOLD
+token_warn_threshold: 80000            # TOKEN_WARN_THRESHOLD
+token_hard_threshold: 100000           # TOKEN_HARD_THRESHOLD
+cache_purge_mb_threshold: 12000        # CACHE_PURGE_MB_THRESHOLD
+cache_idle_seconds: 60                 # CACHE_IDLE_SECONDS
+# blockops_log_file:                   # BLOCKOPS_LOG_FILE  (default ~/.blockops/proxy.log)

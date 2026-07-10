@@ -6,7 +6,7 @@ on:
 
 jobs:
   syntax-and-unit:
-    runs-on: ubuntu-latest
+    runs-on: studio-ci
     env:
       PYTHONDONTWRITEBYTECODE: "1"
     steps:

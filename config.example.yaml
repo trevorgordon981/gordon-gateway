@@ -22,8 +22,8 @@ otel_endpoint: "http://127.0.0.1:4317"   # env OTEL_ENDPOINT (otel-collector gRP
 trace_content: true               # env TRACE_CONTENT  (false = no prompt/completion span events)
 service_name: "llm-gateway"       # env OTEL_SERVICE_NAME  (metrics-proxy used "llm-metrics-proxy")
 primary_user_id: "U0ABVDL7C9M"    # env PRIMARY_USER_ID  (Slack id -> user_class=primary)
-sonnet_input_price: 3.0           # env SONNET_INPUT_PRICE   ($/1M input tok, Sonnet-equivalent cost)
-sonnet_output_price: 15.0         # env SONNET_OUTPUT_PRICE  ($/1M output tok)
+sonnet_input_price: 15.0          # env SONNET_INPUT_PRICE   ($/1M input tok, Opus-equivalent cost)
+sonnet_output_price: 75.0         # env SONNET_OUTPUT_PRICE  ($/1M output tok, Opus rate)
 # metrics_state_file:             # env METRICS_STATE_FILE  (default ~/gordon-gateway/metrics_state.json)
 # metrics_state_save_interval: 30 # env METRICS_STATE_SAVE_INTERVAL
 
@@ -76,7 +76,7 @@ backend_strip_path_prefix: ""             # env BACKEND_STRIP_PATH_PREFIX  (e.g.
 model_name: ""                            # env MODEL_NAME    (session-banner display name)
 
 # Canonical model path. An unknown/missing `model` field is coerced to this by
-# normalize_upstream_model() so the upstream mlx-vlm server does NOT cache-clear
+# normalize_upstream_model() so the configured serving engine does NOT cache-clear
 # / cold-reload on an unrecognized id. This is the value the studio's ~8 default
 # aliases all point at; override if Walter serves a different local model.
 walter_canonical_model: "/Users/alfredpennyworth/models/qwen3.5-122b-a10b-8bit"   # env WALTER_CANONICAL_MODEL
@@ -114,6 +114,12 @@ loop_cycle_stop_reps: 4                # LOOP_CYCLE_STOP_REPS
 loop_cycle_max_len: 4                  # LOOP_CYCLE_MAX_LEN
 loop_session_nudge_limit: 8            # LOOP_SESSION_NUDGE_LIMIT
 repeat_parse_error_stop: 2             # REPEAT_PARSE_ERROR_STOP
+# Conversation state is isolated by X-Claude-Code-Session-Id (plus agent ID),
+# X-Gordon-Session-Id, metadata.session_id, or a deterministic root fallback.
+# The in-memory LRU is bounded and idle entries expire; raw IDs are never stored.
+session_state_max: 512                 # SESSION_STATE_MAX
+session_state_ttl_seconds: 43200       # SESSION_STATE_TTL_SECONDS (12 hours)
+session_parse_error_keys_max: 32       # SESSION_PARSE_ERROR_KEYS_MAX (per session)
 tool_result_compression_threshold: 15000   # TOOL_RESULT_COMPRESSION_THRESHOLD
 token_warn_threshold: 80000            # TOKEN_WARN_THRESHOLD
 token_hard_threshold: 100000           # TOKEN_HARD_THRESHOLD

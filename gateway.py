@@ -47,7 +47,7 @@ import os
 import re
 import time
 import uuid
-from collections import Counter
+from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -84,6 +84,42 @@ except Exception:  # pragma: no cover
 # ===========================================================================
 # CONFIG
 # ===========================================================================
+_SECRET_ENV_NAMES = frozenset({"MASTER_KEY", "OPENROUTER_API_KEY"})
+
+
+def _load_secret_env() -> None:
+    """Load only gateway secrets from a deployment-local, owner-only file.
+
+    launchd property lists are ordinary files and must not contain credentials.
+    Explicit process environment variables still win, which keeps tests and
+    one-off deployments straightforward.
+    """
+    path = Path(os.environ.get(
+        "GATEWAY_SECRET_ENV", os.path.expanduser("~/.hermes/.env")
+    ))
+    if not path.exists():
+        return
+    stat_result = path.stat()
+    if stat_result.st_uid != os.getuid() or stat_result.st_mode & 0o077:
+        raise SystemExit(f"gateway secret file must be owner-only: {path}")
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key not in _SECRET_ENV_NAMES or key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if value:
+            os.environ[key] = value
+
+
+_load_secret_env()
+
+
 def _load_config() -> dict:
     """Layered config: YAML file (if present + PyYAML available) merged under
     environment-variable overrides. Returns a flat dict of settings."""
@@ -152,8 +188,8 @@ TRACE_CONTENT = _get_bool("trace_content", "TRACE_CONTENT", True)
 SERVICE_NAME = str(_get("service_name", "OTEL_SERVICE_NAME", "llm-gateway"))
 
 # metrics-proxy cost + attribution config (used by trace + metrics layer)
-SONNET_INPUT_PRICE = _get_float("sonnet_input_price", "SONNET_INPUT_PRICE", 3.0) / 1_000_000
-SONNET_OUTPUT_PRICE = _get_float("sonnet_output_price", "SONNET_OUTPUT_PRICE", 15.0) / 1_000_000
+SONNET_INPUT_PRICE = _get_float("sonnet_input_price", "SONNET_INPUT_PRICE", 15.0) / 1_000_000
+SONNET_OUTPUT_PRICE = _get_float("sonnet_output_price", "SONNET_OUTPUT_PRICE", 75.0) / 1_000_000
 PRIMARY_USER_ID = str(_get("primary_user_id", "PRIMARY_USER_ID", "U0ABVDL7C9M"))
 STATE_FILE = Path(str(_get(
     "metrics_state_file", "METRICS_STATE_FILE",
@@ -280,8 +316,8 @@ BACKEND_STRIP_PATH_PREFIX = str(_get("backend_strip_path_prefix", "BACKEND_STRIP
 _MODEL_NAME = str(_get("model_name", "MODEL_NAME", ""))
 _MODEL_DISPLAY = _MODEL_NAME or "local model"
 # walter canonical model path: an unknown/missing model id is coerced to this so
-# the upstream mlx-vlm server does not cache-clear / cold-reload (which costs tens
-# of seconds and returns empty 200s during the swap). Env/YAML overridable.
+# an OpenAI-compatible backend does not cache-clear / cold-reload on an alias
+# mismatch. Studio uses Trevor's custom Python engine. Env/YAML overridable.
 WALTER_CANONICAL_MODEL = str(_get(
     "walter_canonical_model", "WALTER_CANONICAL_MODEL",
     "/Users/alfredpennyworth/models/qwen3.5-122b-a10b-8bit",
@@ -296,7 +332,7 @@ REASON_BACKEND = str(_get("reason_backend", "REASON_BACKEND", WALTER_BACKEND))
 
 def _default_walter_aliases() -> dict[str, str]:
     """The studio blockops MODEL_ALIASES (~8 aliases). Each maps a friendly
-    alias to the canonical mlx-vlm model path so the served-model-name matches
+    alias to the canonical backend model path so the served-model-name matches
     what the backend expects. Mirrors ~alfredpennyworth/blockops-proxy.py."""
     canon = WALTER_CANONICAL_MODEL
     return {
@@ -339,7 +375,7 @@ ALIAS_REVERSE = {v: k for k, v in MODEL_ALIASES.items()}
 
 
 def normalize_upstream_model(data: dict, log_fn=None) -> None:
-    """Coerce data['model'] to a canonical mlx-vlm path so unrecognized model
+    """Coerce data['model'] to the configured backend's canonical path so unknown
     names don't trigger a cache-clear/cold-reload on the server. Ported from the
     studio's blockops-proxy.py.
 
@@ -381,6 +417,13 @@ MAX_CONCURRENT = _get_int("max_concurrent", "MAX_CONCURRENT", 3)
 COLD_START_WARN_S = _get_int("cold_start_warn_s", "COLD_START_WARN_S", 300)
 CACHE_PURGE_MB_THRESHOLD = _get_int("cache_purge_mb_threshold", "CACHE_PURGE_MB_THRESHOLD", 12_000)
 CACHE_IDLE_SECONDS = _get_int("cache_idle_seconds", "CACHE_IDLE_SECONDS", 60)
+SESSION_STATE_MAX = max(1, _get_int("session_state_max", "SESSION_STATE_MAX", 512))
+SESSION_STATE_TTL_SECONDS = max(60, _get_int(
+    "session_state_ttl_seconds", "SESSION_STATE_TTL_SECONDS", 12 * 60 * 60,
+))
+SESSION_PARSE_ERROR_KEYS_MAX = max(1, _get_int(
+    "session_parse_error_keys_max", "SESSION_PARSE_ERROR_KEYS_MAX", 32,
+))
 
 BLOCKOPS_LOG_FILE = str(_get("blockops_log_file", "BLOCKOPS_LOG_FILE", os.path.expanduser("~/.blockops/proxy.log")))
 
@@ -479,13 +522,13 @@ def _init_otel() -> None:
     _metric_objs["tool_calls"] = _meter.create_counter("llm.tool_calls", description="Number of tool calls")
     _metric_objs["requests"] = _meter.create_counter("llm.requests", description="Total requests")
     _metric_objs["duration"] = _meter.create_histogram("llm.request.duration", description="Request latency in seconds", unit="s")
-    _metric_objs["cost"] = _meter.create_counter("llm.cost.sonnet_equivalent", description="Sonnet equivalent cost in USD", unit="USD")
+    _metric_objs["cost"] = _meter.create_counter("llm.cost.sonnet_equivalent", description="Opus equivalent cost in USD", unit="USD")
 
 
 def _resolve_user(headers: dict) -> tuple[str, str]:
     user_id = headers.get("x-hermes-user") or headers.get("X-Hermes-User") or ""
     if not user_id:
-        return "", "unknown"
+        return PRIMARY_USER_ID, "primary"  # single-user: header-less traffic = primary user (Trevor)
     if user_id == PRIMARY_USER_ID:
         return user_id, "primary"
     return user_id, "other"
@@ -937,6 +980,10 @@ async def chat_completions(request: Request, authorization: str | None = Header(
             continue
         upstream_body = dict(body)
         upstream_body["model"] = backend.upstream_model
+        # Same 16384 floor as anthropic_to_openai_request(): Hermes sends no/low
+        # max_tokens on chat/completions and mlx-serve then defaults to 256,
+        # length-truncating Slack replies. Floor only raises, never lowers.
+        upstream_body["max_tokens"] = max(int(upstream_body.get("max_tokens") or 0), 16384)
         # o11y: on streaming requests, inject stream_options.include_usage so the
         # upstream emits a final usage chunk and the trace layer records real
         # token counts (matches what metrics-proxy did, and /v1/messages above).
@@ -1102,6 +1149,11 @@ def anthropic_to_openai_request(req: dict[str, Any]) -> dict[str, Any]:
                 out["tool_choice"] = {"type": "function", "function": {"name": tc.get("name", "")}}
     if "max_tokens" in req:
         out["max_tokens"] = req["max_tokens"]
+    # Floor: the 2026-06-02 Hermes upgrade reverted run_agent.py's max_tokens=16384 default
+    # back to None, so Alfred's Slack replies truncate (finish_reason='length'). Enforce a
+    # durable floor HERE in the gateway so future Hermes upgrades can't silently break it.
+    # Only ever raises, never lowers an explicit larger request.
+    out["max_tokens"] = max(int(out.get("max_tokens") or 0), 16384)
     if "temperature" in req:
         out["temperature"] = req["temperature"]
     if "top_p" in req:
@@ -1111,6 +1163,19 @@ def anthropic_to_openai_request(req: dict[str, Any]) -> dict[str, Any]:
     if req.get("stream"):
         out["stream"] = True
         out["stream_options"] = {"include_usage": True}
+    # Thinking control: default OFF so Slack replies are snappy on the slow local model;
+    # opt in per-message by starting a line with "think:" (case-insensitive). The trigger
+    # token is stripped before the message reaches the model. Both the top-level field and
+    # chat_template_kwargs are set (different mlx_lm versions read different ones).
+    _think_on = False
+    for _m in reversed(out["messages"]):
+        if _m.get("role") == "user" and isinstance(_m.get("content"), str):
+            if re.search(r"(?im)^\s*think:\s*", _m["content"]):
+                _think_on = True
+                _m["content"] = re.sub(r"(?im)^\s*think:\s*", "", _m["content"], count=1)
+            break
+    out["enable_thinking"] = _think_on
+    out["chat_template_kwargs"] = {**(out.get("chat_template_kwargs") or {}), "enable_thinking": _think_on, "thinking_mode": ("enabled" if _think_on else "disabled")}
     return out
 
 
@@ -1432,17 +1497,143 @@ MEM_WARN_TIERS = [
            "⚡ *Memory NOTICE* — {avail:.1f} GB free ({pct:.0f}% of {total:.0f} GB). Session is getting long."),
 ]
 
-# walter session state
-_last_actual_prompt_tokens = 0
-_banner_sent = False
-_last_message_count = 0
-_session_nudge_count = 0
-_parse_error_counts: dict = {}
-_last_prompt_tokens = 0
-_is_new_session = True
+# Walter conversation state. Resource-wide state (_last_request_time,
+# _inflight_per_backend and _tool_prompt_cache) remains process-wide by design;
+# everything that describes one conversation lives in the bounded LRU below.
+@dataclass
+class WalterSessionState:
+    last_actual_prompt_tokens: int = 0
+    banner_sent: bool = False
+    last_message_count: int = 0
+    session_nudge_count: int = 0
+    parse_error_counts: OrderedDict[str, int] = field(default_factory=OrderedDict)
+    last_prompt_tokens: int = 0
+    is_new_session: bool = True
+    last_seen: float = field(default_factory=time.monotonic)
+
+
+_SESSION_ID_HEADERS = (
+    "x-claude-code-session-id",
+    "x-gordon-session-id",
+    "x-hermes-session-id",
+    "x-session-id",
+    "x-conversation-id",
+)
+_SESSION_METADATA_KEYS = ("session_id", "conversation_id", "thread_id")
+_session_states: OrderedDict[str, WalterSessionState] = OrderedDict()
 _last_request_time = 0.0
 _inflight_per_backend: dict = {}
 _tool_prompt_cache: dict = {}
+
+
+def _stable_json(value: Any) -> str:
+    """Canonical, non-secret-bearing input for a deterministic fingerprint."""
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return repr(value)
+
+
+def _session_key(headers: dict, data: dict, user_id: str) -> tuple[str, str]:
+    """Return an opaque, stable conversation key and its non-sensitive source.
+
+    Claude Code's explicit session header is authoritative. Agent IDs scope
+    subagents within the parent session because their message histories and loop
+    counters are independent. Other clients can send X-Gordon-Session-Id (or a
+    conventional equivalent) or metadata.session_id. The final fallback hashes
+    the immutable conversation root so ordinary stateless OpenAI clients still
+    retain state as their message list grows.
+    """
+    normalized_headers = {str(k).lower(): str(v) for k, v in headers.items()}
+    explicit = ""
+    source = ""
+    for header in _SESSION_ID_HEADERS:
+        value = normalized_headers.get(header, "").strip()
+        if value:
+            explicit = value
+            source = header
+            break
+
+    if not explicit:
+        metadata = data.get("metadata")
+        if isinstance(metadata, dict):
+            for key in _SESSION_METADATA_KEYS:
+                value = metadata.get(key)
+                if value is not None and str(value).strip():
+                    explicit = str(value).strip()
+                    source = f"metadata.{key}"
+                    break
+
+    agent_id = normalized_headers.get("x-claude-code-agent-id", "").strip()
+    if explicit:
+        raw_identity = _stable_json({"user": user_id, "session": explicit, "agent": agent_id})
+        digest = hashlib.sha256(raw_identity.encode("utf-8", "replace")).hexdigest()[:32]
+        return f"explicit:{digest}", source
+
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        messages = []
+    root_messages = []
+    first_user_seen = False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        if role == "system" and not first_user_seen:
+            root_messages.append({"role": role, "content": message.get("content")})
+        elif role == "user":
+            root_messages.append({"role": role, "content": message.get("content")})
+            first_user_seen = True
+            break
+    fallback_identity = _stable_json({
+        "user": user_id,
+        "agent": agent_id,
+        "root": root_messages,
+    })
+    digest = hashlib.sha256(fallback_identity.encode("utf-8", "replace")).hexdigest()[:32]
+    return f"fallback:{digest}", "conversation-root"
+
+
+def _prune_session_states(now: float | None = None) -> None:
+    """Expire idle entries and enforce the configured LRU ceiling."""
+    if now is None:
+        now = time.monotonic()
+    cutoff = now - SESSION_STATE_TTL_SECONDS
+    while _session_states:
+        _key, oldest = next(iter(_session_states.items()))
+        if oldest.last_seen >= cutoff:
+            break
+        _session_states.popitem(last=False)
+    while len(_session_states) > SESSION_STATE_MAX:
+        _session_states.popitem(last=False)
+
+
+def _get_session_state(session_key: str, now: float | None = None) -> WalterSessionState:
+    """Fetch/create one session state while maintaining bounded LRU order."""
+    if now is None:
+        now = time.monotonic()
+    _prune_session_states(now)
+    state = _session_states.pop(session_key, None)
+    if state is None:
+        while len(_session_states) >= SESSION_STATE_MAX:
+            _session_states.popitem(last=False)
+        state = WalterSessionState(last_seen=now)
+    else:
+        state.last_seen = now
+    _session_states[session_key] = state
+    return state
+
+
+def _record_parse_error(counts: OrderedDict[str, int], signature: str) -> None:
+    """Increment a malformed-call signature without unbounded per-session keys."""
+    if signature in counts:
+        counts[signature] += 1
+        counts.move_to_end(signature)
+        return
+    while len(counts) >= SESSION_PARSE_ERROR_KEYS_MAX:
+        counts.popitem(last=False)
+    counts[signature] = 1
 
 
 def _rewrite_backend_path(path_qs: str) -> str:
@@ -1477,7 +1668,7 @@ def _backend_for_model(model_name: str) -> str:
     return WALTER_BACKEND
 
 
-async def purge_vmlx_cache():
+async def purge_backend_cache():
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.delete(f"{WALTER_BACKEND}/v1/cache?type=all")
@@ -1615,22 +1806,22 @@ def get_memory_warning() -> tuple[str | None, float]:
         return None, 0.0
 
 
-def estimate_actual_tokens(messages: list) -> int:
+def estimate_actual_tokens(messages: list, session_state: WalterSessionState | None = None) -> int:
     total_chars = sum(len(m.get("content", "") or "") for m in messages)
     char_estimate = int(total_chars / 3.0)
-    return max(char_estimate, _last_actual_prompt_tokens)
+    last_actual = session_state.last_actual_prompt_tokens if session_state is not None else 0
+    return max(char_estimate, last_actual)
 
 
-def estimate_cache_tokens(prompt_tokens: int) -> tuple[int, int]:
-    global _is_new_session, _last_prompt_tokens
-    if _is_new_session:
+def estimate_cache_tokens(prompt_tokens: int, session_state: WalterSessionState) -> tuple[int, int]:
+    if session_state.is_new_session:
         cache_write = prompt_tokens
         cache_read = 0
-        _is_new_session = False
+        session_state.is_new_session = False
     else:
         cache_read = prompt_tokens
         cache_write = 0
-    _last_prompt_tokens = prompt_tokens
+    session_state.last_prompt_tokens = prompt_tokens
     return cache_read, cache_write
 
 
@@ -1776,7 +1967,7 @@ def strip_thinking(text: str) -> str:
     return text
 
 
-def parse_tool_calls(content: str):
+def parse_tool_calls(content: str, parse_error_counts: OrderedDict[str, int] | None = None):
     tool_calls = []
     json_tc_pattern = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
     for raw in json_tc_pattern.findall(content):
@@ -1855,7 +2046,8 @@ def parse_tool_calls(content: str):
             if parsed is None:
                 raw_sig = content[json_start:json_start+80]
                 bolog(f"TOOL_PARSE_ERROR tc_line at {json_start}: {e} raw={raw_sig!r}")
-                _parse_error_counts[raw_sig] = _parse_error_counts.get(raw_sig, 0) + 1
+                if parse_error_counts is not None:
+                    _record_parse_error(parse_error_counts, raw_sig)
                 eol = content.find("\n", json_start)
                 if eol == -1:
                     eol = len(content)
@@ -2003,12 +2195,13 @@ def parse_tool_calls(content: str):
     return cleaned, tool_calls
 
 
-def rewrite_response(resp_data: dict) -> dict:
+def rewrite_response(resp_data: dict,
+                     parse_error_counts: OrderedDict[str, int] | None = None) -> dict:
     try:
         choice = resp_data["choices"][0]
         message = choice.get("message", {})
         content = message.get("content") or ""
-        cleaned_content, tool_calls = parse_tool_calls(content)
+        cleaned_content, tool_calls = parse_tool_calls(content, parse_error_counts)
         if tool_calls:
             message["content"] = cleaned_content or None
             message["tool_calls"] = tool_calls
@@ -2168,11 +2361,10 @@ async def _walter_passthrough_get():
 async def walter_handle(request: Request):
     """Walter-mode chat completions handler. Port of blockops-proxy.handle()'s
     chat path. Non-chat paths handled by walter_passthrough()."""
-    global _banner_sent, _last_message_count, _last_actual_prompt_tokens
-    global _last_request_time, _session_nudge_count, _parse_error_counts, _is_new_session
+    global _last_request_time
     _last_request_time = time.time()
     start = time.monotonic()
-    body_bytes = await request.read()
+    body_bytes = await request.body()
     headers = {k: v for k, v in request.headers.items()
                if k.lower() not in ("host", "content-length", "transfer-encoding")}
     try:
@@ -2181,11 +2373,16 @@ async def walter_handle(request: Request):
         bolog(f"BODY_PARSE_ERROR path={request.url.path} err={e}")
         return JSONResponse({"error": "invalid JSON"}, status_code=400)
 
-    user_id, user_class = _resolve_user(dict(request.headers))
+    request_headers = dict(request.headers)
+    user_id, user_class = _resolve_user(request_headers)
+    session_key, session_source = _session_key(request_headers, data, user_id)
+    session_state = _get_session_state(session_key)
     requested_model = data.get("model", "<none>")
-    bolog(f"INBOUND path={request.url.path} body_len={len(body_bytes)} model={requested_model}")
+    bolog(f"INBOUND path={request.url.path} body_len={len(body_bytes)} model={requested_model} "
+          f"session={session_key} session_source={session_source}")
 
     messages = data.get("messages", [])
+    client_message_count = len(messages)
     tools = data.pop("tools", None)
     data.pop("tool_choice", None)
 
@@ -2203,13 +2400,24 @@ async def walter_handle(request: Request):
             content={"error": {"message": f"Too many messages ({len(messages)}). Start a new session (/new).",
                                "type": "request_too_large", "code": 413}})
 
-    client_wanted_stream = bool(data.get("stream", False))
-    if len(messages) < _last_message_count:
-        _session_nudge_count = 0
-        _parse_error_counts.clear()
+    # Only accepted requests advance conversation state. A busy/oversized
+    # request must not look like a reset to the next valid turn.
+    previous_message_count = session_state.last_message_count
+    is_session_reset = client_message_count < previous_message_count
+    if is_session_reset:
+        session_state.banner_sent = False
+        session_state.session_nudge_count = 0
+        session_state.parse_error_counts.clear()
+        session_state.last_actual_prompt_tokens = 0
+        session_state.last_prompt_tokens = 0
+        session_state.is_new_session = True
+        bolog(f"SESSION_RESET session={session_key} msgs={previous_message_count}→{client_message_count} "
+              "— session state cleared; shared backend cache retained")
+    session_state.last_message_count = client_message_count
 
+    client_wanted_stream = bool(data.get("stream", False))
     worst_sig, worst_count = None, 0
-    for sig, cnt in _parse_error_counts.items():
+    for sig, cnt in session_state.parse_error_counts.items():
         if cnt > worst_count:
             worst_sig, worst_count = sig, cnt
     if worst_count >= REPEAT_PARSE_ERROR_STOP:
@@ -2219,7 +2427,7 @@ async def walter_handle(request: Request):
         notice = (f"⚠️ The model emitted a malformed tool call {worst_count}× in a row "
                   f"that the parser could not recover. Stopping the turn to avoid leaking raw "
                   f"tool-call JSON. Offending signature: `{worst_sig[:120]}`. Rephrase the request or run `/new`.")
-        _parse_error_counts.clear()
+        session_state.parse_error_counts.clear()
         _walter_trace(model_alias, body_bytes, 0, 0, 0, time.monotonic() - start, user_id, user_class, client_wanted_stream)
         if client_wanted_stream:
             return _walter_simple_stream(request_id, model_alias, notice)
@@ -2274,10 +2482,12 @@ async def walter_handle(request: Request):
                           f"succeeded, you are undoing its work by running the next one. If all calls are failing the same way, "
                           f"the approach is wrong, try a different one or report the blocker to the user in plain text. Do not "
                           f"emit another tool call that matches this pattern.")
-        _session_nudge_count += 1
-        bolog(f"SESSION_NUDGE_COUNT={_session_nudge_count}/{LOOP_DETECT_SESSION_NUDGE_LIMIT}")
-        if _session_nudge_count >= LOOP_DETECT_SESSION_NUDGE_LIMIT:
-            bolog(f"LOOP_SESSION_STOP count={_session_nudge_count} limit={LOOP_DETECT_SESSION_NUDGE_LIMIT} messages={len(messages)}")
+        session_state.session_nudge_count += 1
+        bolog(f"SESSION_NUDGE_COUNT session={session_key} "
+              f"count={session_state.session_nudge_count}/{LOOP_DETECT_SESSION_NUDGE_LIMIT}")
+        if session_state.session_nudge_count >= LOOP_DETECT_SESSION_NUDGE_LIMIT:
+            bolog(f"LOOP_SESSION_STOP session={session_key} count={session_state.session_nudge_count} "
+                  f"limit={LOOP_DETECT_SESSION_NUDGE_LIMIT} messages={len(messages)}")
             request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
             model_alias = data.get("model", "local")
             notice = (f"⚠️ Session-wide loop guard tripped: the model has been nudged {LOOP_DETECT_SESSION_NUDGE_LIMIT} times "
@@ -2292,31 +2502,23 @@ async def walter_handle(request: Request):
         messages.append({"role": "user", "content": nudge_text})
         data["messages"] = messages
 
-    user_msgs = [m for m in messages if m.get("role") == "user"]
-    current_msg_count = len(messages)
-    _is_session_reset = current_msg_count < _last_message_count
-    if _is_session_reset:
-        _banner_sent = False
-        _session_nudge_count = 0
-        _parse_error_counts.clear()
-        bolog(f"SESSION_RESET detected (msgs {_last_message_count}→{current_msg_count}) — purging KV cache")
-        await purge_vmlx_cache()
-        _last_actual_prompt_tokens = 0
-    _last_message_count = current_msg_count
-    is_session_start = not _banner_sent and len(user_msgs) == 1
+    user_msgs = [m for m in messages[:client_message_count] if m.get("role") == "user"]
+    is_session_start = not session_state.banner_sent and len(user_msgs) == 1
     if is_session_start:
-        _banner_sent = True
-        _is_new_session = True
+        session_state.banner_sent = True
+        session_state.is_new_session = True
         _, avail_gb = get_memory_warning()
         notice = make_session_start_notice(avail_gb)
         messages = inject_system_notice(messages, notice)
-        bolog(f"SESSION_START — notice injected into system message (avail={avail_gb:.1f}GB)")
+        bolog(f"SESSION_START session={session_key} — notice injected into system message "
+              f"(avail={avail_gb:.1f}GB)")
 
     if tools:
         return await _walter_tools_path(request, data, headers, messages, tools, requested_backend,
-                                        is_session_start, body_bytes, user_id, user_class, start)
+                                        is_session_start, body_bytes, user_id, user_class, start,
+                                        session_state)
     return await _walter_no_tools_path(request, data, headers, messages, is_session_start,
-                                       body_bytes, user_id, user_class, start)
+                                       body_bytes, user_id, user_class, start, session_state)
 
 
 def _walter_simple_stream(request_id, model_alias, notice, role_first=False):
@@ -2333,8 +2535,8 @@ def _walter_simple_stream(request_id, model_alias, notice, role_first=False):
 
 
 async def _walter_tools_path(request, data, headers, messages, tools, requested_backend,
-                             is_session_start, body_bytes, user_id, user_class, start):
-    global _last_actual_prompt_tokens
+                             is_session_start, body_bytes, user_id, user_class, start,
+                             session_state: WalterSessionState):
     tool_system = build_tool_system_prompt(tools)
     messages = inject_tool_prompt(messages, tool_system)
     messages = sanitize_messages_for_backend(messages)
@@ -2344,17 +2546,21 @@ async def _walter_tools_path(request, data, headers, messages, tools, requested_
     if not data.get('max_tokens') or data['max_tokens'] < 4096:
         data["max_tokens"] = 16384
     data["enable_thinking"] = False
+    # 2026-06-18 fix: tool turns were sent with no temperature -> M3 defaults to greedy 0.0,
+    # which makes it loop its native <invoke> tool tokens into gibberish. Non-greedy floor breaks the loop.
+    data.setdefault("temperature", 0.3)
+    data.setdefault("top_p", 0.95)
     normalize_upstream_model(data, bolog)
 
-    est_tokens = estimate_actual_tokens(messages)
+    est_tokens = estimate_actual_tokens(messages, session_state)
     bolog(f"TOOLS_INJECTED count={len(tools)} model_req={data.get('model','?')} est_tokens~{est_tokens}")
 
     if est_tokens >= TOKEN_HARD_THRESHOLD:
         bolog(f"CTX_LARGE est_tokens={est_tokens} threshold={TOKEN_HARD_THRESHOLD} — truncating")
-        messages = truncate_messages(messages, 80_000)
+        messages = truncate_messages(messages, 150_000)
         data["messages"] = messages
-        _last_actual_prompt_tokens = 0
-        est_tokens = estimate_actual_tokens(messages)
+        session_state.last_actual_prompt_tokens = 0
+        est_tokens = estimate_actual_tokens(messages, session_state)
         bolog(f"CTX_TRUNCATED est_tokens_after={est_tokens} kept_msgs={len(messages)}")
 
     context_warning = None
@@ -2372,7 +2578,6 @@ async def _walter_tools_path(request, data, headers, messages, tools, requested_
     bolog(f"INFLIGHT_INC backend={requested_backend} count={backend_count}")
 
     async def gen():
-        global _last_actual_prompt_tokens
         in_tok = out_tok = tcc = 0
         try:
             if is_session_start:
@@ -2400,12 +2605,14 @@ async def _walter_tools_path(request, data, headers, messages, tools, requested_
             usage = resp_data.get('usage', {})
             if usage:
                 bolog(f"RESPONSE usage={usage}")
-                _last_actual_prompt_tokens = usage.get("prompt_tokens", usage.get("input_tokens", _last_actual_prompt_tokens))
+                session_state.last_actual_prompt_tokens = usage.get(
+                    "prompt_tokens", usage.get("input_tokens", session_state.last_actual_prompt_tokens),
+                )
             resp_str = json.dumps(resp_data)
             for path, alias in ALIAS_REVERSE.items():
                 resp_str = resp_str.replace(path, alias)
             resp_data = json.loads(resp_str)
-            resp_data = rewrite_response(resp_data)
+            resp_data = rewrite_response(resp_data, session_state.parse_error_counts)
 
             choice = resp_data.get("choices", [{}])[0]
             message = choice.get("message", {})
@@ -2433,7 +2640,7 @@ async def _walter_tools_path(request, data, headers, messages, tools, requested_
                 yield make_sse_chunk(request_id, model_alias, {}, "stop")
 
             if not usage:
-                est_prompt = estimate_actual_tokens(messages)
+                est_prompt = estimate_actual_tokens(messages, session_state)
                 est_completion = len(content) // 4
                 usage = {"prompt_tokens": est_prompt, "completion_tokens": est_completion, "total_tokens": est_prompt + est_completion}
             in_tok = usage.get("prompt_tokens", 0)
@@ -2455,8 +2662,8 @@ async def _walter_tools_path(request, data, headers, messages, tools, requested_
 
 
 async def _walter_no_tools_path(request, data, headers, messages, is_session_start,
-                                body_bytes, user_id, user_class, start):
-    global _last_actual_prompt_tokens
+                                body_bytes, user_id, user_class, start,
+                                session_state: WalterSessionState):
     original_model = data.get("model", "<none>")
     # Capture the client's streaming intent BEFORE upstream-body mutation so we
     # can turn on usage injection for the trace layer (o11y: complete token
@@ -2469,12 +2676,12 @@ async def _walter_no_tools_path(request, data, headers, messages, is_session_sta
         # real input/output tokens instead of 0/0.
         data["stream_options"] = {**(data.get("stream_options") or {}), "include_usage": True}
 
-    est_tokens = estimate_actual_tokens(messages)
+    est_tokens = estimate_actual_tokens(messages, session_state)
     if est_tokens >= TOKEN_HARD_THRESHOLD:
         bolog(f"CTX_LARGE est_tokens={est_tokens} threshold={TOKEN_HARD_THRESHOLD} — truncating")
         messages = truncate_messages(messages, 8_000)
         data["messages"] = messages
-        est_tokens = estimate_actual_tokens(messages)
+        est_tokens = estimate_actual_tokens(messages, session_state)
         bolog(f"CTX_TRUNCATED est_tokens_after={est_tokens}")
 
     ctx_warn_text = None
@@ -2498,11 +2705,13 @@ async def _walter_no_tools_path(request, data, headers, messages, is_session_sta
                 usage = resp_data.get("usage", {})
                 if usage:
                     bolog(f"RESPONSE usage={usage}")
-                    _last_actual_prompt_tokens = usage.get("prompt_tokens", usage.get("input_tokens", _last_actual_prompt_tokens))
+                    session_state.last_actual_prompt_tokens = usage.get(
+                        "prompt_tokens", usage.get("input_tokens", session_state.last_actual_prompt_tokens),
+                    )
                 else:
-                    est_prompt = estimate_actual_tokens(messages)
+                    est_prompt = estimate_actual_tokens(messages, session_state)
                     est_completion = len(str(resp_data.get("choices", [{}])[0].get("message", {}).get("content", ""))) // 4
-                    est_cache_read, est_cache_write = estimate_cache_tokens(est_prompt)
+                    est_cache_read, est_cache_write = estimate_cache_tokens(est_prompt, session_state)
                     resp_data["usage"] = {"prompt_tokens": est_prompt, "completion_tokens": est_completion,
                                           "total_tokens": est_prompt + est_completion,
                                           "cache_read_tokens": est_cache_read, "cache_write_tokens": est_cache_write}
@@ -2557,7 +2766,7 @@ async def walter_passthrough(request: Request):
         model_id = request.url.path[len("/v1/models/"):]
         return JSONResponse({"id": model_id, "object": "model", "created": int(time.time()), "owned_by": "my-local"})
     url = WALTER_BACKEND + _rewrite_backend_path(request.url.path)
-    body_bytes = await request.read()
+    body_bytes = await request.body()
     headers = {k: v for k, v in request.headers.items()
                if k.lower() not in ("host", "content-length", "transfer-encoding")}
     try:
@@ -2583,7 +2792,7 @@ async def cache_janitor():
             size_mb = await get_cache_size_mb()
             if size_mb > CACHE_PURGE_MB_THRESHOLD:
                 bolog(f"JANITOR_PURGE cache={size_mb:.0f}MB idle={idle_sec:.0f}s")
-                await purge_vmlx_cache()
+                await purge_backend_cache()
         except Exception as e:
             bolog(f"JANITOR_ERROR {e}")
 

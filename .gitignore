@@ -1,4 +1,22 @@
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.DS_Store
+
+# Deployment-local secrets/config and state
 config.yaml
 .env
+*.env
+.gateway.pid
+*.pid
+metrics_state.json
+
+# Runtime output and manual backups
+*.log
+*.out
+*.err
+*.bak
+*.bak-*
+*.bak.*

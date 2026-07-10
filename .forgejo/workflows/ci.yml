@@ -1,0 +1,17 @@
+name: offline-ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  syntax-and-unit:
+    runs-on: ubuntu-latest
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v6
+      - name: Python syntax
+        run: python3 -m compileall -q gateway.py tests
+      - name: Offline session-state unit tests
+        run: python3 -m unittest discover -s tests -v

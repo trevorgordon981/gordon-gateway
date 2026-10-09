@@ -257,3 +257,7 @@ Verification after activation:
 Rollback is file-level: restore the previous reviewed `gateway.py` and plist,
 then restart only `ai.alfred.llm-proxy`. Do not restart, signal, or purge the
 custom Python serving engine.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

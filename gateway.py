@@ -235,7 +235,10 @@ def _default_alfred_backends() -> dict[str, Backend]:
         "qwen-397b": Backend(
             name="qwen-397b",
             base_url="http://127.0.0.1:8090/v1",
-            upstream_model="/Users/alfredpennyworth/models/qwen3.5-397b-6bit",
+            upstream_model=os.environ.get(
+                "QWEN397B_MODEL_PATH",
+                "/Users/alfredpennyworth/models/qwen3.5-397b-6bit",
+            ),
             api_key="not-needed",
         ),
         "kimi-k2.6": Backend(
@@ -258,7 +261,7 @@ def _default_alfred_backends() -> dict[str, Backend]:
         ),
         "qwen-alfred-router": Backend(
             name="qwen-alfred-router",
-            base_url="http://spark-d10b:9003/v1",
+            base_url=os.environ.get("ROUTER_BASE_URL", "http://127.0.0.1:9003/v1"),
             upstream_model="qwen-alfred-router",
             api_key="not-needed",
         ),
@@ -268,7 +271,7 @@ def _default_alfred_backends() -> dict[str, Backend]:
             upstream_model="nvidia/nemotron-3-super-120b-a12b:free",
             api_key=os.environ.get("OPENROUTER_API_KEY", ""),
             extra_headers={
-                "HTTP-Referer": "http://100.92.88.67",
+                "HTTP-Referer": os.environ.get("OPENROUTER_REFERER", "http://localhost"),
                 "X-Title": "Alfred-Backup",
             },
         ),

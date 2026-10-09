@@ -54,7 +54,7 @@ sonnet_output_price: 75.0         # env SONNET_OUTPUT_PRICE  ($/1M output tok, O
 #     upstream_model: "glm-5.1"
 #     api_key: "not-needed"
 #   - name: qwen-alfred-router
-#     base_url: "http://spark-d10b:9003/v1"
+#     base_url: "http://127.0.0.1:9003/v1"   # env ROUTER_BASE_URL
 #     upstream_model: "qwen-alfred-router"
 #     api_key: "not-needed"
 #   - name: openrouter-free
@@ -62,7 +62,7 @@ sonnet_output_price: 75.0         # env SONNET_OUTPUT_PRICE  ($/1M output tok, O
 #     upstream_model: "nvidia/nemotron-3-super-120b-a12b:free"
 #     api_key: "env:OPENROUTER_API_KEY"
 #     extra_headers:
-#       HTTP-Referer: "http://100.92.88.67"
+#       HTTP-Referer: "http://localhost"     # env OPENROUTER_REFERER
 #       X-Title: "Alfred-Backup"
 
 # Fallback chains: requested model -> ordered list of fallback backend names.

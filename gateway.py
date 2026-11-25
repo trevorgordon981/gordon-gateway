@@ -203,6 +203,35 @@ if MODE == "alfred" and not MASTER_KEY:
     raise SystemExit("MASTER_KEY required in alfred mode")
 
 MAX_BODY_BYTES = _get_int("max_body_bytes", "MAX_BODY_BYTES", 50 * 1024 * 1024)
+DEFAULT_MAX_TOKENS = _get_int("default_max_tokens", "DEFAULT_MAX_TOKENS", 16384)
+
+
+def _resolve_max_tokens(
+    raw_value: Any,
+    default: int | None = None,
+    ceiling: int | None = None,
+) -> int:
+    """Resolve max_tokens without inflating explicit caller budgets.
+
+    Applies the default only when max_tokens is omitted, None, or non-positive.
+    Any explicit positive budget (including small values like 128 or 1024) is
+    preserved verbatim. If a positive ceiling is configured, only values above
+    the ceiling are clamped down.
+    """
+    fallback = DEFAULT_MAX_TOKENS if default is None else default
+    resolved: int | None = None
+    if raw_value is not None and not isinstance(raw_value, bool):
+        try:
+            parsed = int(raw_value)
+        except (TypeError, ValueError):
+            parsed = 0
+        if parsed > 0:
+            resolved = parsed
+    if resolved is None:
+        resolved = fallback
+    if ceiling is not None and ceiling > 0 and resolved > ceiling:
+        return ceiling
+    return resolved
 
 HEADER_BLOCKLIST = {
     "authorization", "x-api-key",
@@ -980,10 +1009,10 @@ async def chat_completions(request: Request, authorization: str | None = Header(
             continue
         upstream_body = dict(body)
         upstream_body["model"] = backend.upstream_model
-        # Same 16384 floor as anthropic_to_openai_request(): Hermes sends no/low
-        # max_tokens on chat/completions and mlx-serve then defaults to 256,
-        # length-truncating Slack replies. Floor only raises, never lowers.
-        upstream_body["max_tokens"] = max(int(upstream_body.get("max_tokens") or 0), 16384)
+        # Apply default max_tokens only when omitted/None so callers without an
+        # explicit budget do not hit tiny backend defaults, while preserving any
+        # explicit caller budget verbatim.
+        upstream_body["max_tokens"] = _resolve_max_tokens(upstream_body.get("max_tokens"))
         # o11y: on streaming requests, inject stream_options.include_usage so the
         # upstream emits a final usage chunk and the trace layer records real
         # token counts (matches what metrics-proxy did, and /v1/messages above).
@@ -1147,13 +1176,9 @@ def anthropic_to_openai_request(req: dict[str, Any]) -> dict[str, Any]:
                 out["tool_choice"] = "required"
             elif tc_type == "tool":
                 out["tool_choice"] = {"type": "function", "function": {"name": tc.get("name", "")}}
-    if "max_tokens" in req:
-        out["max_tokens"] = req["max_tokens"]
-    # Floor: the 2026-06-02 Hermes upgrade reverted run_agent.py's max_tokens=16384 default
-    # back to None, so Alfred's Slack replies truncate (finish_reason='length'). Enforce a
-    # durable floor HERE in the gateway so future Hermes upgrades can't silently break it.
-    # Only ever raises, never lowers an explicit larger request.
-    out["max_tokens"] = max(int(out.get("max_tokens") or 0), 16384)
+    # Apply default max_tokens only when omitted/None; preserve any explicit
+    # caller budget (including small values) verbatim.
+    out["max_tokens"] = _resolve_max_tokens(req.get("max_tokens"))
     if "temperature" in req:
         out["temperature"] = req["temperature"]
     if "top_p" in req:
@@ -2543,8 +2568,7 @@ async def _walter_tools_path(request, data, headers, messages, tools, requested_
     data["messages"] = messages
     data.pop("tools", None)
     data.pop("tool_choice", None)
-    if not data.get('max_tokens') or data['max_tokens'] < 4096:
-        data["max_tokens"] = 16384
+    data["max_tokens"] = _resolve_max_tokens(data.get("max_tokens"))
     data["enable_thinking"] = False
     # 2026-06-18 fix: tool turns were sent with no temperature -> M3 defaults to greedy 0.0,
     # which makes it loop its native <invoke> tool tokens into gibberish. Non-greedy floor breaks the loop.

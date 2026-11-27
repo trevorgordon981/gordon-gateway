@@ -893,12 +893,22 @@ def _summarize_messages(messages: list) -> str:
 def _count_tool_calls_in_chunk(data: dict) -> int:
     count = 0
     for choice in data.get("choices", []):
-        msg = choice.get("message", {})
-        if msg.get("tool_calls"):
-            count += len(msg["tool_calls"])
-        delta = choice.get("delta", {})
-        if delta.get("tool_calls"):
-            count += len(delta["tool_calls"])
+        if not isinstance(choice, dict):
+            continue
+        msg = choice.get("message") or {}
+        if isinstance(msg, dict):
+            if msg.get("tool_calls"):
+                count += len(msg["tool_calls"])
+            msg_fc = msg.get("function_call")
+            if isinstance(msg_fc, dict) and (msg_fc.get("name") or msg_fc.get("arguments")):
+                count += 1
+        delta = choice.get("delta") or {}
+        if isinstance(delta, dict):
+            if delta.get("tool_calls"):
+                count += len(delta["tool_calls"])
+            delta_fc = delta.get("function_call")
+            if isinstance(delta_fc, dict) and delta_fc.get("name"):
+                count += 1
     return count
 
 
@@ -1172,9 +1182,23 @@ def _has_openai_completion_evidence(evt: dict[str, Any]) -> bool:
         if isinstance(tool_calls, list) and any(isinstance(tc, dict) for tc in tool_calls):
             return True
         func_call = delta.get("function_call")
-        if isinstance(func_call, dict) and bool(func_call):
-            return True
+        if isinstance(func_call, dict):
+            fc_name = func_call.get("name")
+            fc_args = func_call.get("arguments")
+            if (
+                (isinstance(fc_name, str) and fc_name.strip())
+                or (isinstance(fc_args, str) and fc_args != "")
+                or (fc_args is not None and not isinstance(fc_args, str))
+            ):
+                return True
     return False
+
+
+def _legacy_function_call_id(completion_id: Any = None, index: int = 0) -> str:
+    """Build a deterministic Anthropic tool_use ID for a legacy OpenAI function_call."""
+    cid = completion_id.strip() if isinstance(completion_id, str) and completion_id.strip() else "legacy"
+    digest = hashlib.sha256(f"{cid}:function_call:{index}".encode("utf-8")).hexdigest()[:24]
+    return f"toolu_{digest}"
 
 
 @dataclass
@@ -1218,6 +1242,24 @@ def _normalize_openai_completion(obj: dict[str, Any]) -> NormalizedCompletion:
         for tc in raw_tool_calls:
             if isinstance(tc, dict):
                 tool_calls.append(dict(tc))
+
+    raw_func_call = msg.get("function_call")
+    if isinstance(raw_func_call, dict) and raw_func_call:
+        fc_name_raw = raw_func_call.get("name")
+        fc_name = fc_name_raw if isinstance(fc_name_raw, str) else ""
+        fc_args_raw = raw_func_call.get("arguments")
+        if isinstance(fc_args_raw, str):
+            fc_args = fc_args_raw
+        elif fc_args_raw is not None:
+            fc_args = json.dumps(fc_args_raw)
+        else:
+            fc_args = ""
+        if fc_name or fc_args:
+            tool_calls.append({
+                "id": _legacy_function_call_id(obj.get("id"), len(tool_calls)),
+                "type": "function",
+                "function": {"name": fc_name, "arguments": fc_args},
+            })
 
     finish_reason = choice.get("finish_reason")
     if not isinstance(finish_reason, str) or not finish_reason:
@@ -2269,6 +2311,44 @@ async def openai_stream_to_anthropic(byte_iter: AsyncIterator[bytes], model_name
                     out.append(_sse("content_block_delta", {"type": "content_block_delta",
                                     "index": tool_blocks[tc_key]["block_idx"],
                                     "delta": {"type": "input_json_delta", "partial_json": fn["arguments"]}}))
+            func_call = delta.get("function_call")
+            if isinstance(func_call, dict) and func_call:
+                fc_name_raw = func_call.get("name")
+                fc_name = fc_name_raw if isinstance(fc_name_raw, str) else ""
+                fc_args_raw = func_call.get("arguments")
+                if isinstance(fc_args_raw, str):
+                    fc_args = fc_args_raw
+                elif fc_args_raw is not None:
+                    fc_args = json.dumps(fc_args_raw)
+                else:
+                    fc_args = ""
+                if fc_name or fc_args:
+                    fc_key = "_legacy_function_call"
+                    if fc_key not in tool_blocks:
+                        if reasoning_block_open:
+                            out.append(_sse("content_block_stop", {"type": "content_block_stop", "index": reasoning_block_idx}))
+                            reasoning_block_open = False
+                        if text_block_open:
+                            out.append(_sse("content_block_stop", {"type": "content_block_stop", "index": text_block_idx}))
+                            text_block_open = False
+                        block_idx = next_block_idx
+                        next_block_idx += 1
+                        fc_id = _legacy_function_call_id(evt.get("id"), len(tool_blocks))
+                        tool_blocks[fc_key] = {"block_idx": block_idx, "id": fc_id, "name": fc_name, "args": ""}
+                        out.append(_sse("content_block_start", {
+                            "type": "content_block_start",
+                            "index": block_idx,
+                            "content_block": {"type": "tool_use", "id": fc_id, "name": fc_name, "input": {}},
+                        }))
+                    elif fc_name and not tool_blocks[fc_key]["name"]:
+                        tool_blocks[fc_key]["name"] = fc_name
+                    if fc_args:
+                        tool_blocks[fc_key]["args"] += fc_args
+                        out.append(_sse("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": tool_blocks[fc_key]["block_idx"],
+                            "delta": {"type": "input_json_delta", "partial_json": fc_args},
+                        }))
             if isinstance(finish, str) and finish.strip():
                 saw_finish_reason = True
                 stop_reason = _FINISH_TO_STOP.get(finish, "end_turn")

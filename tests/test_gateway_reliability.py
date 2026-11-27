@@ -1,4 +1,4 @@
-"""Comprehensive offline regression tests for GW-01 through GW-08.
+"""Comprehensive offline regression tests for GW-01 through GW-09.
 
 Covers:
   - GW-01: Incremental LF/CRLF/CR SSE framing, arbitrary chunk fragmentation,
@@ -18,6 +18,9 @@ Covers:
   - GW-08: Separation of usage/metadata-only SSE frames from real completion
     evidence and one consistent post-`[DONE]` terminal-marker policy across
     both OpenAI and Anthropic routes (exercised end-to-end via ASGI).
+  - GW-09: Legacy OpenAI `function_call` translation (streaming and non-streaming)
+    into Anthropic `tool_use` content blocks with deterministic IDs alongside
+    modern `tool_calls` control (exercised end-to-end via ASGI).
 """
 
 from __future__ import annotations
@@ -1618,6 +1621,305 @@ class TelemetryAndHygieneTests(unittest.TestCase):
                 self.assertNotRegex(v, r"\b100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+\b")
         self.assertEqual("external", defaults["openrouter-free"].trust_boundary)
         self.assertEqual("local", defaults["qwen-397b"].trust_boundary)
+
+
+# ===========================================================================
+# GW-09: Legacy OpenAI function_call translation into Anthropic tool_use blocks
+# ===========================================================================
+@unittest.skipUnless(_HAS_WEB_DEPS, "fastapi and httpx required")
+class LegacyFunctionCallTranslationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_asgi_streaming_legacy_function_call_translated_to_anthropic_tool_use(self):
+        legacy_sse = (
+            b'data: {"id":"chatcmpl-legacy-stream","object":"chat.completion.chunk","model":"up",'
+            b'"choices":[{"index":0,"delta":{"role":"assistant","content":null,'
+            b'"function_call":{"name":"get_weather","arguments":""}},"finish_reason":null}]}\n\n'
+            b'data: {"id":"chatcmpl-legacy-stream","object":"chat.completion.chunk","model":"up",'
+            b'"choices":[{"index":0,"delta":{"function_call":{"arguments":"{\\"city\\":"}},"finish_reason":null}]}\n\n'
+            b'data: {"id":"chatcmpl-legacy-stream","object":"chat.completion.chunk","model":"up",'
+            b'"choices":[{"index":0,"delta":{"function_call":{"arguments":"\\"Seattle\\",\\"unit\\":\\"c\\"}"}},'
+            b'"finish_reason":null}]}\n\n'
+            b'data: {"id":"chatcmpl-legacy-stream","object":"chat.completion.chunk","model":"up",'
+            b'"choices":[{"index":0,"delta":{},"finish_reason":"function_call"}],'
+            b'"usage":{"prompt_tokens":21,"completion_tokens":9}}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        expected_id = gateway._legacy_function_call_id("chatcmpl-legacy-stream", 0)
+        backend = gateway.Backend("local-primary", "http://127.0.0.1:9001/v1", "up", "k")
+        auth = {"Authorization": "Bearer secret"}
+
+        for chunk_size in (13, len(legacy_sse)):
+            with self.subTest(chunk_size=chunk_size):
+                def _handler(_request: httpx.Request) -> httpx.Response:
+                    return httpx.Response(
+                        status_code=200,
+                        headers={"content-type": "text/event-stream"},
+                        stream=_ChunkedAsyncByteStream(legacy_sse, chunk_size=chunk_size),
+                    )
+
+                upstream_transport = httpx.MockTransport(_handler)
+                real_async_client = httpx.AsyncClient
+
+                def _client_factory(*args, **kwargs):
+                    kwargs["transport"] = upstream_transport
+                    return real_async_client(*args, **kwargs)
+
+                asgi_transport = httpx.ASGITransport(app=gateway.app)
+                async with real_async_client(transport=asgi_transport, base_url="http://gateway.local") as client:
+                    with patch.object(gateway, "MODE", "alfred"), \
+                         patch.object(gateway, "MASTER_KEY", "secret"), \
+                         patch.object(gateway, "BACKENDS", {"local-primary": backend}), \
+                         patch.object(gateway, "FALLBACKS", {}), \
+                         patch.object(gateway, "TRACING_ENABLED", False), \
+                         patch.object(gateway, "verify_swap_in_loaded", AsyncMock(return_value=True)), \
+                         patch.object(gateway.httpx, "AsyncClient", side_effect=_client_factory):
+                        resp_a = await client.post(
+                            "/v1/messages",
+                            headers=auth,
+                            json={"model": "local-primary", "stream": True, "messages": [{"role": "user", "content": "weather?"}]},
+                        )
+                        resp_a2 = await client.post(
+                            "/v1/messages",
+                            headers=auth,
+                            json={"model": "local-primary", "stream": True, "messages": [{"role": "user", "content": "weather?"}]},
+                        )
+                        resp_o = await client.post(
+                            "/v1/chat/completions",
+                            headers=auth,
+                            json={"model": "local-primary", "stream": True, "messages": [{"role": "user", "content": "weather?"}]},
+                        )
+
+                self.assertEqual(200, resp_a.status_code)
+                events_a = _parse_output_sse(resp_a.content)
+                event_names = [et for et, _ in events_a]
+                self.assertEqual("message_start", event_names[0])
+                self.assertIn("content_block_start", event_names)
+                self.assertIn("content_block_delta", event_names)
+                self.assertIn("content_block_stop", event_names)
+                self.assertEqual("message_delta", event_names[-2])
+                self.assertEqual("message_stop", event_names[-1])
+
+                start_evts = [json.loads(d) for et, d in events_a if et == "content_block_start"]
+                self.assertEqual(1, len(start_evts))
+                self.assertEqual(
+                    {"type": "tool_use", "id": expected_id, "name": "get_weather", "input": {}},
+                    start_evts[0]["content_block"],
+                )
+                delta_evts = [json.loads(d) for et, d in events_a if et == "content_block_delta"]
+                self.assertEqual(
+                    ['{"city":', '"Seattle","unit":"c"}'],
+                    [e["delta"]["partial_json"] for e in delta_evts],
+                )
+                self.assertTrue(all(e["delta"]["type"] == "input_json_delta" for e in delta_evts))
+
+                reconstructed = _reconstruct_anthropic_from_sse(resp_a.content)
+                self.assertTrue(reconstructed["_saw_message_stop"])
+                self.assertEqual("tool_use", reconstructed["stop_reason"])
+                self.assertEqual({"input_tokens": 21, "output_tokens": 9}, reconstructed["usage"])
+                self.assertEqual(
+                    [{"type": "tool_use", "id": expected_id, "name": "get_weather", "input": {"city": "Seattle", "unit": "c"}}],
+                    reconstructed["content"],
+                )
+
+                # Deterministic ID across repeated runs
+                reconstructed2 = _reconstruct_anthropic_from_sse(resp_a2.content)
+                self.assertEqual(reconstructed["content"], reconstructed2["content"])
+
+                # OpenAI passthrough still forwards legacy function_call chunks + [DONE]
+                self.assertEqual(200, resp_o.status_code)
+                events_o = _parse_output_sse(resp_o.content)
+                self.assertEqual("[DONE]", events_o[-1][1])
+                objs_o = [json.loads(d) for _, d in events_o[:-1]]
+                self.assertEqual("get_weather", objs_o[0]["choices"][0]["delta"]["function_call"]["name"])
+                self.assertTrue(all(o["model"] == "local-primary" for o in objs_o))
+
+    async def test_asgi_nonstream_and_buffered_legacy_function_call_translated_with_id_parity(self):
+        legacy_json = {
+            "id": "chatcmpl-legacy-sync",
+            "object": "chat.completion",
+            "created": 1700000010,
+            "model": "up",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "function_call": {
+                        "name": "get_weather",
+                        "arguments": '{"city":"Seattle","unit":"c"}',
+                    },
+                },
+                "finish_reason": "function_call",
+            }],
+            "usage": {"prompt_tokens": 21, "completion_tokens": 9, "total_tokens": 30},
+        }
+        expected_id = gateway._legacy_function_call_id("chatcmpl-legacy-sync", 0)
+        backend = gateway.Backend("local-primary", "http://127.0.0.1:9001/v1", "up", "k")
+        auth = {"Authorization": "Bearer secret"}
+
+        def _json_handler(_request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                status_code=200,
+                headers={"content-type": "application/json"},
+                content=json.dumps(legacy_json).encode("utf-8"),
+            )
+
+        upstream_transport = httpx.MockTransport(_json_handler)
+        real_async_client = httpx.AsyncClient
+
+        def _client_factory(*args, **kwargs):
+            kwargs["transport"] = upstream_transport
+            return real_async_client(*args, **kwargs)
+
+        asgi_transport = httpx.ASGITransport(app=gateway.app)
+        async with real_async_client(transport=asgi_transport, base_url="http://gateway.local") as client:
+            with patch.object(gateway, "MODE", "alfred"), \
+                 patch.object(gateway, "MASTER_KEY", "secret"), \
+                 patch.object(gateway, "BACKENDS", {"local-primary": backend}), \
+                 patch.object(gateway, "FALLBACKS", {}), \
+                 patch.object(gateway, "TRACING_ENABLED", False), \
+                 patch.object(gateway, "verify_swap_in_loaded", AsyncMock(return_value=True)), \
+                 patch.object(gateway.httpx, "AsyncClient", side_effect=_client_factory):
+                resp_nonstream = await client.post(
+                    "/v1/messages",
+                    headers=auth,
+                    json={"model": "local-primary", "stream": False, "messages": [{"role": "user", "content": "weather?"}]},
+                )
+                # Buffered JSON returned to a stream=True request goes through _json_to_fake_sse -> openai_stream_to_anthropic
+                resp_buffered_stream = await client.post(
+                    "/v1/messages",
+                    headers=auth,
+                    json={"model": "local-primary", "stream": True, "messages": [{"role": "user", "content": "weather?"}]},
+                )
+
+        self.assertEqual(200, resp_nonstream.status_code)
+        body_sync = resp_nonstream.json()
+        self.assertEqual("tool_use", body_sync["stop_reason"])
+        self.assertEqual({"input_tokens": 21, "output_tokens": 9}, body_sync["usage"])
+        self.assertEqual(
+            [{"type": "tool_use", "id": expected_id, "name": "get_weather", "input": {"city": "Seattle", "unit": "c"}}],
+            body_sync["content"],
+        )
+
+        self.assertEqual(200, resp_buffered_stream.status_code)
+        reconstructed = _reconstruct_anthropic_from_sse(resp_buffered_stream.content)
+        self.assertTrue(reconstructed["_saw_message_stop"])
+        self.assertEqual(body_sync["stop_reason"], reconstructed["stop_reason"])
+        self.assertEqual(body_sync["content"], reconstructed["content"])
+        self.assertEqual(body_sync["usage"], reconstructed["usage"])
+
+        # Metric helper counts legacy function_call on non-streaming responses
+        self.assertEqual(1, gateway._count_tool_calls_in_chunk(legacy_json))
+
+    async def test_asgi_text_before_legacy_function_call_zero_arg_and_modern_tool_calls_control(self):
+        thinking_text_fc_sse = (
+            b'data: {"id":"chatcmpl-mix","model":"up","choices":[{"index":0,"delta":{"reasoning_content":"plan first"},"finish_reason":null}]}\n\n'
+            b'data: {"id":"chatcmpl-mix","model":"up","choices":[{"index":0,"delta":{"content":"Checking now."},"finish_reason":null}]}\n\n'
+            b'data: {"id":"chatcmpl-mix","model":"up","choices":[{"index":0,"delta":{"function_call":{"name":"ping","arguments":""}},"finish_reason":"function_call"}],'
+            b'"usage":{"prompt_tokens":10,"completion_tokens":4}}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        modern_tool_sse = (
+            b'data: {"id":"chatcmpl-modern","model":"up","choices":[{"index":0,"delta":{"role":"assistant",'
+            b'"tool_calls":[{"index":0,"id":"call_modern_1","type":"function","function":{"name":"lookup","arguments":""}}]},"finish_reason":null}]}\n\n'
+            b'data: {"id":"chatcmpl-modern","model":"up","choices":[{"index":0,"delta":{'
+            b'"tool_calls":[{"index":0,"function":{"arguments":"{\\"ticker\\":\\"NVDA\\"}"}}]},"finish_reason":"tool_calls"}],'
+            b'"usage":{"prompt_tokens":12,"completion_tokens":6}}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        modern_tool_json = {
+            "id": "chatcmpl-modern-sync",
+            "object": "chat.completion",
+            "created": 1700000011,
+            "model": "up",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_modern_sync",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": '{"ticker":"NVDA"}'},
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 6, "total_tokens": 18},
+        }
+        backend = gateway.Backend("local-primary", "http://127.0.0.1:9001/v1", "up", "k")
+        auth = {"Authorization": "Bearer secret"}
+
+        cases = [
+            ("thinking_text_zero_arg_legacy_fc", True, thinking_text_fc_sse, "text/event-stream"),
+            ("modern_tool_calls_stream_control", True, modern_tool_sse, "text/event-stream"),
+            ("modern_tool_calls_sync_control", False, json.dumps(modern_tool_json).encode("utf-8"), "application/json"),
+        ]
+        for label, is_stream, payload, ctype in cases:
+            with self.subTest(case=label):
+                def _handler(_request: httpx.Request, _p=payload, _ct=ctype, _s=is_stream) -> httpx.Response:
+                    if _s:
+                        return httpx.Response(
+                            status_code=200,
+                            headers={"content-type": _ct},
+                            stream=_ChunkedAsyncByteStream(_p, chunk_size=17),
+                        )
+                    return httpx.Response(status_code=200, headers={"content-type": _ct}, content=_p)
+
+                upstream_transport = httpx.MockTransport(_handler)
+                real_async_client = httpx.AsyncClient
+
+                def _client_factory(*args, **kwargs):
+                    kwargs["transport"] = upstream_transport
+                    return real_async_client(*args, **kwargs)
+
+                asgi_transport = httpx.ASGITransport(app=gateway.app)
+                async with real_async_client(transport=asgi_transport, base_url="http://gateway.local") as client:
+                    with patch.object(gateway, "MODE", "alfred"), \
+                         patch.object(gateway, "MASTER_KEY", "secret"), \
+                         patch.object(gateway, "BACKENDS", {"local-primary": backend}), \
+                         patch.object(gateway, "FALLBACKS", {}), \
+                         patch.object(gateway, "TRACING_ENABLED", False), \
+                         patch.object(gateway, "verify_swap_in_loaded", AsyncMock(return_value=True)), \
+                         patch.object(gateway.httpx, "AsyncClient", side_effect=_client_factory):
+                        resp = await client.post(
+                            "/v1/messages",
+                            headers=auth,
+                            json={"model": "local-primary", "stream": is_stream, "messages": [{"role": "user", "content": "run"}]},
+                        )
+
+                self.assertEqual(200, resp.status_code)
+                if label == "thinking_text_zero_arg_legacy_fc":
+                    rec = _reconstruct_anthropic_from_sse(resp.content)
+                    self.assertTrue(rec["_saw_message_stop"])
+                    self.assertEqual("tool_use", rec["stop_reason"])
+                    self.assertEqual(
+                        [
+                            {"type": "thinking", "thinking": "plan first"},
+                            {"type": "text", "text": "Checking now."},
+                            {
+                                "type": "tool_use",
+                                "id": gateway._legacy_function_call_id("chatcmpl-mix", 0),
+                                "name": "ping",
+                                "input": {},
+                            },
+                        ],
+                        rec["content"],
+                    )
+                elif label == "modern_tool_calls_stream_control":
+                    rec = _reconstruct_anthropic_from_sse(resp.content)
+                    self.assertTrue(rec["_saw_message_stop"])
+                    self.assertEqual("tool_use", rec["stop_reason"])
+                    self.assertEqual(
+                        [{"type": "tool_use", "id": "call_modern_1", "name": "lookup", "input": {"ticker": "NVDA"}}],
+                        rec["content"],
+                    )
+                else:
+                    body = resp.json()
+                    self.assertEqual("tool_use", body["stop_reason"])
+                    self.assertEqual(
+                        [{"type": "tool_use", "id": "call_modern_sync", "name": "lookup", "input": {"ticker": "NVDA"}}],
+                        body["content"],
+                    )
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Comprehensive offline regression tests for GW-01 through GW-07.
+"""Comprehensive offline regression tests for GW-01 through GW-08.
 
 Covers:
   - GW-01: Incremental LF/CRLF/CR SSE framing, arbitrary chunk fragmentation,
@@ -15,6 +15,9 @@ Covers:
     TLS enforcement for non-loopback OTLP endpoints, and secret-file alignment.
   - GW-07: Generic public defaults (no embedded deployment identifiers) and
     declared dependency ranges.
+  - GW-08: Separation of usage/metadata-only SSE frames from real completion
+    evidence and one consistent post-`[DONE]` terminal-marker policy across
+    both OpenAI and Anthropic routes (exercised end-to-end via ASGI).
 """
 
 from __future__ import annotations
@@ -709,6 +712,383 @@ class SSEFramingAndCompletionTests(unittest.IsolatedAsyncioTestCase):
         reconstructed = _reconstruct_anthropic_from_sse(body)
         self.assertTrue(reconstructed["_saw_message_stop"])
         self.assertEqual([{"type": "text", "text": "decoded-backup"}], reconstructed["content"])
+
+    async def test_usage_only_or_metadata_only_stream_emits_error_never_success_in_translators(self):
+        cases = [
+            (
+                "usage_empty_choices_then_done",
+                b'data: {"id":"c1","model":"up","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":0}}\n\n'
+                b"data: [DONE]\n\n",
+            ),
+            (
+                "usage_without_choices_then_done",
+                b'data: {"id":"c1","model":"up","usage":{"prompt_tokens":12,"completion_tokens":0}}\r\n\r\n'
+                b"data: [DONE]\r\n\r\n",
+            ),
+            (
+                "usage_empty_choices_eof",
+                b'data: {"id":"c1","model":"up","choices":[],"usage":{"prompt_tokens":12,"completion_tokens":0}}\n\n',
+            ),
+            (
+                "role_only_empty_delta_then_done",
+                b'data: {"id":"c1","model":"up","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+                b"data: [DONE]\n\n",
+            ),
+        ]
+        for label, raw_sse in cases:
+            for chunk_size in (7, len(raw_sse)):
+                with self.subTest(case=label, chunk_size=chunk_size):
+                    out_o = await _collect_stream(
+                        gateway.rewrite_stream_model(_chunked_iter(raw_sse, chunk_size), "req-model")
+                    )
+                    events_o = _parse_output_sse(out_o)
+                    self.assertEqual(["error"], [et for et, _ in events_o])
+                    self.assertNotIn(b"[DONE]", out_o)
+                    err_o = json.loads(events_o[0][1])
+                    self.assertEqual("upstream_stream_error", err_o["error"]["type"])
+
+                    out_a = await _collect_stream(
+                        gateway.openai_stream_to_anthropic(_chunked_iter(raw_sse, chunk_size), "req-model")
+                    )
+                    events_a = _parse_output_sse(out_a)
+                    self.assertEqual(["error"], [et for et, _ in events_a])
+                    self.assertNotIn(b"message_start", out_a)
+                    self.assertNotIn(b"message_delta", out_a)
+                    self.assertNotIn(b"message_stop", out_a)
+                    err_a = json.loads(events_a[0][1])
+                    self.assertEqual("error", err_a["type"])
+                    self.assertEqual("api_error", err_a["error"]["type"])
+
+    async def test_post_done_trailing_error_and_garbage_ignored_consistently_in_translators(self):
+        base = (
+            b'data: {"id":"c1","model":"up","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":"stop"}],'
+            b'"usage":{"prompt_tokens":9,"completion_tokens":3}}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        trailing_cases = [
+            (
+                "post_done_event_error",
+                base + b'event: error\ndata: {"error":{"type":"server_error","message":"late diagnostic"}}\n\n',
+            ),
+            (
+                "post_done_json_error",
+                base + b'data: {"error":{"type":"server_error","message":"late json diagnostic"}}\n\n',
+            ),
+            (
+                "post_done_unterminated_garbage",
+                base + b'data: {"truncated_after_done',
+            ),
+        ]
+        for label, raw_sse in trailing_cases:
+            for chunk_size in (11, len(raw_sse)):
+                with self.subTest(case=label, chunk_size=chunk_size):
+                    out_o = await _collect_stream(
+                        gateway.rewrite_stream_model(_chunked_iter(raw_sse, chunk_size), "req-model")
+                    )
+                    events_o = _parse_output_sse(out_o)
+                    self.assertEqual("[DONE]", events_o[-1][1])
+                    self.assertNotIn("error", [et for et, _ in events_o])
+                    self.assertNotIn(b"late diagnostic", out_o)
+                    self.assertNotIn(b"late json diagnostic", out_o)
+
+                    out_a = await _collect_stream(
+                        gateway.openai_stream_to_anthropic(_chunked_iter(raw_sse, chunk_size), "req-model")
+                    )
+                    events_a = _parse_output_sse(out_a)
+                    self.assertNotIn("error", [et for et, _ in events_a])
+                    reconstructed = _reconstruct_anthropic_from_sse(out_a)
+                    self.assertTrue(reconstructed["_saw_message_stop"])
+                    self.assertEqual("end_turn", reconstructed["stop_reason"])
+                    self.assertEqual([{"type": "text", "text": "hello"}], reconstructed["content"])
+                    self.assertEqual({"input_tokens": 9, "output_tokens": 3}, reconstructed["usage"])
+
+    async def test_leading_metadata_and_trailing_usage_preserved_with_valid_completion(self):
+        raw_sse = (
+            b'data: {"id":"c1","model":"up","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}\n\n'
+            b'data: {"id":"c1","model":"up","choices":[{"index":0,"delta":{"content":"hi there"},"finish_reason":"stop"}]}\n\n'
+            b'data: {"id":"c1","model":"up","choices":[],"usage":{"prompt_tokens":14,"completion_tokens":6}}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        out_o = await _collect_stream(gateway.rewrite_stream_model(_chunked_iter(raw_sse, 13), "req-model"))
+        events_o = _parse_output_sse(out_o)
+        self.assertEqual("[DONE]", events_o[-1][1])
+        self.assertNotIn("error", [et for et, _ in events_o])
+        objs_o = [json.loads(d) for _, d in events_o[:-1]]
+        self.assertEqual(3, len(objs_o))
+        self.assertTrue(all(o["model"] == "req-model" for o in objs_o))
+        self.assertEqual({"prompt_tokens": 14, "completion_tokens": 6}, objs_o[-1]["usage"])
+
+        out_a = await _collect_stream(gateway.openai_stream_to_anthropic(_chunked_iter(raw_sse, 13), "req-model"))
+        reconstructed = _reconstruct_anthropic_from_sse(out_a)
+        self.assertTrue(reconstructed["_saw_message_stop"])
+        self.assertEqual([{"type": "text", "text": "hi there"}], reconstructed["content"])
+        self.assertEqual({"input_tokens": 14, "output_tokens": 6}, reconstructed["usage"])
+
+    async def test_asgi_usage_only_stream_rejected_and_fails_over_on_both_routes(self):
+        usage_only_done = (
+            b'data: {"id":"c1","model":"p-model","choices":[],"usage":{"prompt_tokens":15,"completion_tokens":0}}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        valid_backup = (
+            b'data: {"id":"c2","model":"b-model","choices":[{"index":0,"delta":{"content":"from-backup"},"finish_reason":"stop"}],'
+            b'"usage":{"prompt_tokens":15,"completion_tokens":4}}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        primary = gateway.Backend("local-primary", "http://127.0.0.1:9001/v1", "p-model", "k")
+        backup = gateway.Backend("local-backup", "http://127.0.0.1:9002/v1", "b-model", "k")
+        auth = {"Authorization": "Bearer secret"}
+
+        # 1. Single backend returning usage-only + [DONE] is rejected as an error on BOTH routes.
+        for endpoint in ("/v1/chat/completions", "/v1/messages"):
+            for chunk_size in (17, len(usage_only_done)):
+                with self.subTest(mode="single_backend", endpoint=endpoint, chunk_size=chunk_size):
+                    def _single_handler(_request: httpx.Request) -> httpx.Response:
+                        return httpx.Response(
+                            status_code=200,
+                            headers={"content-type": "text/event-stream"},
+                            stream=_ChunkedAsyncByteStream(usage_only_done, chunk_size=chunk_size),
+                        )
+
+                    upstream_transport = httpx.MockTransport(_single_handler)
+                    real_async_client = httpx.AsyncClient
+
+                    def _client_factory(*args, **kwargs):
+                        kwargs["transport"] = upstream_transport
+                        return real_async_client(*args, **kwargs)
+
+                    asgi_transport = httpx.ASGITransport(app=gateway.app)
+                    async with real_async_client(transport=asgi_transport, base_url="http://gateway.local") as client:
+                        with patch.object(gateway, "MODE", "alfred"), \
+                             patch.object(gateway, "MASTER_KEY", "secret"), \
+                             patch.object(gateway, "BACKENDS", {"local-primary": primary}), \
+                             patch.object(gateway, "FALLBACKS", {}), \
+                             patch.object(gateway, "TRACING_ENABLED", False), \
+                             patch.object(gateway, "verify_swap_in_loaded", AsyncMock(return_value=True)), \
+                             patch.object(gateway.httpx, "AsyncClient", side_effect=_client_factory):
+                            resp = await client.post(
+                                endpoint,
+                                headers=auth,
+                                json={"model": "local-primary", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                            )
+                    self.assertEqual(502, resp.status_code)
+                    self.assertNotIn(b"[DONE]", resp.content)
+                    self.assertNotIn(b"message_start", resp.content)
+                    self.assertNotIn(b"message_delta", resp.content)
+                    self.assertNotIn(b"message_stop", resp.content)
+                    err_json = resp.json()
+                    self.assertEqual("all_backends_failed", err_json["error"]["code"])
+                    self.assertEqual("upstream_protocol_error", err_json["error"]["attempts"][0]["error_type"])
+
+        # 2. With a fallback backend configured, usage-only + [DONE] fails over cleanly before HTTP 200.
+        for endpoint in ("/v1/chat/completions", "/v1/messages"):
+            with self.subTest(mode="failover", endpoint=endpoint):
+                seen_urls: list[str] = []
+
+                def _failover_handler(request: httpx.Request) -> httpx.Response:
+                    seen_urls.append(str(request.url))
+                    payload = usage_only_done if "9001" in str(request.url) else valid_backup
+                    return httpx.Response(
+                        status_code=200,
+                        headers={"content-type": "text/event-stream"},
+                        stream=_ChunkedAsyncByteStream(payload, chunk_size=19),
+                    )
+
+                upstream_transport = httpx.MockTransport(_failover_handler)
+                real_async_client = httpx.AsyncClient
+
+                def _client_factory(*args, **kwargs):
+                    kwargs["transport"] = upstream_transport
+                    return real_async_client(*args, **kwargs)
+
+                asgi_transport = httpx.ASGITransport(app=gateway.app)
+                async with real_async_client(transport=asgi_transport, base_url="http://gateway.local") as client:
+                    with patch.object(gateway, "MODE", "alfred"), \
+                         patch.object(gateway, "MASTER_KEY", "secret"), \
+                         patch.object(gateway, "BACKENDS", {"local-primary": primary, "local-backup": backup}), \
+                         patch.object(gateway, "FALLBACKS", {"local-primary": ["local-backup"]}), \
+                         patch.object(gateway, "TRACING_ENABLED", False), \
+                         patch.object(gateway, "verify_swap_in_loaded", AsyncMock(return_value=True)), \
+                         patch.object(gateway.httpx, "AsyncClient", side_effect=_client_factory):
+                        resp = await client.post(
+                            endpoint,
+                            headers=auth,
+                            json={"model": "local-primary", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                        )
+                self.assertEqual(200, resp.status_code)
+                self.assertEqual(2, len(seen_urls))
+                if endpoint == "/v1/messages":
+                    reconstructed = _reconstruct_anthropic_from_sse(resp.content)
+                    self.assertTrue(reconstructed["_saw_message_stop"])
+                    self.assertEqual([{"type": "text", "text": "from-backup"}], reconstructed["content"])
+                else:
+                    events = _parse_output_sse(resp.content)
+                    self.assertEqual("[DONE]", events[-1][1])
+                    self.assertNotIn("error", [et for et, _ in events])
+                    objs = [json.loads(d) for _, d in events[:-1]]
+                    self.assertEqual("from-backup", "".join(o["choices"][0]["delta"].get("content", "") for o in objs))
+
+    async def test_asgi_post_done_error_and_controls_consistent_across_openai_and_anthropic(self):
+        post_done_error_sse = (
+            b'data: {"id":"c1","model":"up","choices":[{"index":0,"delta":{"content":"completed ok"},"finish_reason":"stop"}]}\n\n'
+            b'data: {"id":"c1","model":"up","choices":[],"usage":{"prompt_tokens":11,"completion_tokens":5}}\n\n'
+            b"data: [DONE]\n\n"
+            b'event: error\ndata: {"error":{"type":"server_error","message":"diagnostic after done"}}\n\n'
+        )
+        normal_with_usage_sse = (
+            b'data: {"id":"c2","model":"up","choices":[{"index":0,"delta":{"content":"ordinary ok"},"finish_reason":"stop"}]}\n\n'
+            b'data: {"id":"c2","model":"up","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":3}}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        error_before_done_sse = (
+            b'data: {"id":"c3","model":"up","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n'
+            b'event: error\ndata: {"error":{"type":"server_error","message":"failed before done"}}\n\n'
+            b"data: [DONE]\n\n"
+        )
+        backend = gateway.Backend("local-primary", "http://127.0.0.1:9001/v1", "up", "k")
+        auth = {"Authorization": "Bearer secret"}
+
+        # 1. Post-[DONE] diagnostic error: BOTH routes stop cleanly at [DONE] and ignore trailing error.
+        for endpoint in ("/v1/chat/completions", "/v1/messages"):
+            for chunk_size in (23, len(post_done_error_sse)):
+                with self.subTest(case="post_done_error", endpoint=endpoint, chunk_size=chunk_size):
+                    closed_flag = {"closed": False}
+
+                    class _TrackedStream(_ChunkedAsyncByteStream):
+                        async def aclose(self) -> None:
+                            closed_flag["closed"] = True
+
+                    def _handler(_request: httpx.Request) -> httpx.Response:
+                        return httpx.Response(
+                            status_code=200,
+                            headers={"content-type": "text/event-stream"},
+                            stream=_TrackedStream(post_done_error_sse, chunk_size=chunk_size),
+                        )
+
+                    span = _RecordingSpan()
+                    upstream_transport = httpx.MockTransport(_handler)
+                    real_async_client = httpx.AsyncClient
+
+                    def _client_factory(*args, **kwargs):
+                        kwargs["transport"] = upstream_transport
+                        return real_async_client(*args, **kwargs)
+
+                    asgi_transport = httpx.ASGITransport(app=gateway.app)
+                    async with real_async_client(transport=asgi_transport, base_url="http://gateway.local") as client:
+                        with patch.object(gateway, "MODE", "alfred"), \
+                             patch.object(gateway, "MASTER_KEY", "secret"), \
+                             patch.object(gateway, "BACKENDS", {"local-primary": backend}), \
+                             patch.object(gateway, "FALLBACKS", {}), \
+                             patch.object(gateway, "TRACING_ENABLED", True), \
+                             patch.object(gateway, "_start_chat_span", return_value=span), \
+                             patch.object(gateway, "_record_metrics"), \
+                             patch.object(gateway, "verify_swap_in_loaded", AsyncMock(return_value=True)), \
+                             patch.object(gateway.httpx, "AsyncClient", side_effect=_client_factory):
+                            resp = await client.post(
+                                endpoint,
+                                headers=auth,
+                                json={"model": "local-primary", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                            )
+                    self.assertEqual(200, resp.status_code)
+                    self.assertNotIn(b"diagnostic after done", resp.content)
+                    self.assertNotIn("error", [et for et, _ in _parse_output_sse(resp.content)])
+                    self.assertNotIn("error", span.attributes)
+                    self.assertTrue(span.ended)
+                    self.assertTrue(closed_flag["closed"], "upstream stream must be closed after stopping at [DONE]")
+                    if endpoint == "/v1/messages":
+                        reconstructed = _reconstruct_anthropic_from_sse(resp.content)
+                        self.assertTrue(reconstructed["_saw_message_stop"])
+                        self.assertEqual([{"type": "text", "text": "completed ok"}], reconstructed["content"])
+                        self.assertEqual({"input_tokens": 11, "output_tokens": 5}, reconstructed["usage"])
+                    else:
+                        events = _parse_output_sse(resp.content)
+                        self.assertEqual("[DONE]", events[-1][1])
+                        objs = [json.loads(d) for _, d in events[:-1]]
+                        self.assertEqual("completed ok", objs[0]["choices"][0]["delta"]["content"])
+                        self.assertEqual({"prompt_tokens": 11, "completion_tokens": 5}, objs[1]["usage"])
+
+        # 2. Controls: ordinary valid completion + trailing usage passes; error-before-[DONE] fails with error.
+        for endpoint in ("/v1/chat/completions", "/v1/messages"):
+            with self.subTest(case="ordinary_control", endpoint=endpoint):
+                def _ok_handler(_request: httpx.Request) -> httpx.Response:
+                    return httpx.Response(
+                        status_code=200,
+                        headers={"content-type": "text/event-stream"},
+                        stream=_ChunkedAsyncByteStream(normal_with_usage_sse, chunk_size=19),
+                    )
+
+                upstream_transport = httpx.MockTransport(_ok_handler)
+                real_async_client = httpx.AsyncClient
+
+                def _client_factory(*args, **kwargs):
+                    kwargs["transport"] = upstream_transport
+                    return real_async_client(*args, **kwargs)
+
+                asgi_transport = httpx.ASGITransport(app=gateway.app)
+                async with real_async_client(transport=asgi_transport, base_url="http://gateway.local") as client:
+                    with patch.object(gateway, "MODE", "alfred"), \
+                         patch.object(gateway, "MASTER_KEY", "secret"), \
+                         patch.object(gateway, "BACKENDS", {"local-primary": backend}), \
+                         patch.object(gateway, "FALLBACKS", {}), \
+                         patch.object(gateway, "TRACING_ENABLED", False), \
+                         patch.object(gateway, "verify_swap_in_loaded", AsyncMock(return_value=True)), \
+                         patch.object(gateway.httpx, "AsyncClient", side_effect=_client_factory):
+                        resp = await client.post(
+                            endpoint,
+                            headers=auth,
+                            json={"model": "local-primary", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                        )
+                self.assertEqual(200, resp.status_code)
+                if endpoint == "/v1/messages":
+                    reconstructed = _reconstruct_anthropic_from_sse(resp.content)
+                    self.assertTrue(reconstructed["_saw_message_stop"])
+                    self.assertEqual([{"type": "text", "text": "ordinary ok"}], reconstructed["content"])
+                    self.assertEqual({"input_tokens": 7, "output_tokens": 3}, reconstructed["usage"])
+                else:
+                    events = _parse_output_sse(resp.content)
+                    self.assertEqual("[DONE]", events[-1][1])
+                    self.assertNotIn("error", [et for et, _ in events])
+
+            with self.subTest(case="error_before_done_control", endpoint=endpoint):
+                def _err_handler(_request: httpx.Request) -> httpx.Response:
+                    return httpx.Response(
+                        status_code=200,
+                        headers={"content-type": "text/event-stream"},
+                        stream=_ChunkedAsyncByteStream(error_before_done_sse, chunk_size=19),
+                    )
+
+                span = _RecordingSpan()
+                upstream_transport = httpx.MockTransport(_err_handler)
+                real_async_client = httpx.AsyncClient
+
+                def _client_factory(*args, **kwargs):
+                    kwargs["transport"] = upstream_transport
+                    return real_async_client(*args, **kwargs)
+
+                asgi_transport = httpx.ASGITransport(app=gateway.app)
+                async with real_async_client(transport=asgi_transport, base_url="http://gateway.local") as client:
+                    with patch.object(gateway, "MODE", "alfred"), \
+                         patch.object(gateway, "MASTER_KEY", "secret"), \
+                         patch.object(gateway, "BACKENDS", {"local-primary": backend}), \
+                         patch.object(gateway, "FALLBACKS", {}), \
+                         patch.object(gateway, "TRACING_ENABLED", True), \
+                         patch.object(gateway, "_start_chat_span", return_value=span), \
+                         patch.object(gateway, "_record_metrics"), \
+                         patch.object(gateway, "verify_swap_in_loaded", AsyncMock(return_value=True)), \
+                         patch.object(gateway.httpx, "AsyncClient", side_effect=_client_factory):
+                        resp = await client.post(
+                            endpoint,
+                            headers=auth,
+                            json={"model": "local-primary", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                        )
+                self.assertEqual(200, resp.status_code)
+                events = _parse_output_sse(resp.content)
+                self.assertEqual("error", events[-1][0])
+                self.assertIn(b"failed before done", resp.content)
+                self.assertNotIn(b"[DONE]", resp.content)
+                self.assertNotIn(b"message_stop", resp.content)
+                self.assertNotIn(b"message_delta", resp.content)
+                self.assertIs(True, span.attributes.get("error"))
+                self.assertTrue(span.ended)
 
 
 # ===========================================================================

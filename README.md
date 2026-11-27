@@ -39,7 +39,7 @@ flowchart LR
 
 `gordon-gateway` builds directly on standard upstream libraries—**FastAPI**, **uvicorn**, **httpx**, and optional **PyYAML**, **psutil**, and **OpenTelemetry**—without forking them. Everything specific to this repository lives in [gateway.py](gateway.py):
 
-- **Incremental LF/CRLF/CR SSE engine & completion integrity**: `parse_sse_blocks()`, `_open_upstream_sse_stream()`, `rewrite_stream_model()`, and `openai_stream_to_anthropic()` validate the first complete SSE event before committing HTTP `200`, preserve fragmented `\r\n\r\n` streams, and emit explicit `event: error` frames (never `message_stop` / `[DONE]`) on empty, truncated, or prematurely closed streams.
+- **Incremental LF/CRLF/CR SSE engine & completion integrity**: `parse_sse_blocks()`, `_has_openai_completion_evidence()`, `_open_upstream_sse_stream()`, `rewrite_stream_model()`, and `openai_stream_to_anthropic()` require real completion evidence (content, reasoning, tool/function call delta, or `finish_reason`)—never usage/metadata-only frames with `choices: []`—before committing HTTP `200` or emitting terminal success frames, preserve fragmented `\r\n\r\n` streams, emit explicit `event: error` frames (never `message_stop` / `[DONE]`) on empty, usage-only, truncated, or prematurely closed streams, and enforce one terminal-marker policy across both OpenAI and Anthropic routes (once a valid `[DONE]` ends a stream with completion evidence, trailing post-`[DONE]` frames are ignored cleanly).
 - **Normalized completion adapter**: `_normalize_openai_completion()` powers both `openai_to_anthropic_response()` and `_json_to_fake_sse()`, guaranteeing parity across `reasoning_content`, `content`, `tool_calls`, `finish_reason`, and `usage`.
 - **Fail-closed retry & data-boundary policy**: `is_retryable_status()` and `resolve_chain()` keep HTTP `4xx` terminal by default, retry bounded transport/timeout/5xx/malformed-200 failures, and block local-to-external cloud fallback unless explicitly authorized.
 - **Per-session Walter guardrails**: opaque SHA-256 session keys, bounded LRU+TTL state, loop/cycle breakers, and explicit `tool_choice="none"` handling.
@@ -124,7 +124,8 @@ Copy [config.example.yaml](config.example.yaml) to `~/gordon-gateway/config.yaml
 | Feature | Alfred `/v1/chat/completions` | Alfred `/v1/messages` (Anthropic) | Walter `/v1/chat/completions` |
 |---------|-------------------------------|-----------------------------------|-------------------------------|
 | Streaming SSE (LF, CRLF, CR) | Supported (rewrites `model`) | Supported (OpenAI -> Anthropic SSE) | Supported (tool path uses heartbeats + synthesized SSE) |
-| Premature / empty EOF detection | `event: error` (no `[DONE]`) | `event: error` (no `message_stop`) | Returns `502` / `[backend error]` |
+| Premature / empty / usage-only EOF detection | `event: error` / pre-commit `502` (no `[DONE]`) | `event: error` / pre-commit `502` (no `message_stop`) | Returns `502` / `[backend error]` |
+| Post-`[DONE]` terminal-marker policy | Stops at valid `[DONE]`; ignores trailing frames | Stops at valid `[DONE]`; ignores trailing frames | Synthesized terminal `[DONE]` |
 | Reasoning / thinking | Pass-through | `reasoning_content` / `reasoning` -> `thinking` block (JSON + SSE + fake-SSE) | `<think>` stripped before client delivery |
 | `tool_choice: "auto"` | Pass-through | Mapped to `"auto"` | Prompt-injected `TOOL_CALL:` mode |
 | `tool_choice: "none"` | Pass-through | Mapped to `"none"` | Suppresses tool prompt injection (direct path) |

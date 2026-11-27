@@ -1148,6 +1148,35 @@ def _is_valid_openai_sse_chunk(evt: dict[str, Any]) -> bool:
     return isinstance(evt.get("choices"), list) or isinstance(evt.get("usage"), dict)
 
 
+def _has_openai_completion_evidence(evt: dict[str, Any]) -> bool:
+    """Return True if an OpenAI SSE chunk carries real completion evidence
+    (non-empty content/reasoning/refusal delta, tool/function call delta, or
+    non-empty finish_reason) rather than metadata/usage-only frames."""
+    choices = evt.get("choices")
+    if not isinstance(choices, list):
+        return False
+    for ch in choices:
+        if not isinstance(ch, dict):
+            continue
+        finish_reason = ch.get("finish_reason")
+        if isinstance(finish_reason, str) and finish_reason.strip():
+            return True
+        delta = ch.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        for key in ("content", "reasoning_content", "reasoning", "refusal"):
+            val = delta.get(key)
+            if isinstance(val, str) and val != "":
+                return True
+        tool_calls = delta.get("tool_calls")
+        if isinstance(tool_calls, list) and any(isinstance(tc, dict) for tc in tool_calls):
+            return True
+        func_call = delta.get("function_call")
+        if isinstance(func_call, dict) and bool(func_call):
+            return True
+    return False
+
+
 @dataclass
 class NormalizedCompletion:
     id: str
@@ -1415,7 +1444,10 @@ async def _open_upstream_sse_stream(
                                 retryable=True,
                                 error_type="upstream_protocol_error",
                             )
-                        if _extract_sse_error(etype, evt) is None and not _is_valid_openai_sse_chunk(evt):
+                        if _extract_sse_error(etype, evt) is not None:
+                            found_valid_event = True
+                            break
+                        if not _is_valid_openai_sse_chunk(evt):
                             raise UpstreamError(
                                 502,
                                 "upstream SSE stream event missing expected completion or error schema",
@@ -1423,8 +1455,9 @@ async def _open_upstream_sse_stream(
                                 retryable=True,
                                 error_type="upstream_protocol_error",
                             )
-                        found_valid_event = True
-                        break
+                        if _has_openai_completion_evidence(evt):
+                            found_valid_event = True
+                            break
                     if found_valid_event:
                         break
             except httpx.DecodingError as exc:
@@ -1443,20 +1476,31 @@ async def _open_upstream_sse_stream(
                         found_valid_event = True
                         break
                     if data_str == "[DONE]":
-                        break
+                        raise UpstreamError(
+                            502,
+                            "upstream SSE stream ended with done marker before any completion event",
+                            backend.name,
+                            retryable=True,
+                            error_type="upstream_protocol_error",
+                        )
                     try:
                         evt = json.loads(data_str)
                     except json.JSONDecodeError:
                         break
-                    if isinstance(evt, dict) and (
-                        _extract_sse_error(etype, evt) is not None or _is_valid_openai_sse_chunk(evt)
-                    ):
+                    if not isinstance(evt, dict):
+                        break
+                    if _extract_sse_error(etype, evt) is not None:
+                        found_valid_event = True
+                        break
+                    if not _is_valid_openai_sse_chunk(evt):
+                        break
+                    if _has_openai_completion_evidence(evt):
                         found_valid_event = True
                         break
             if not found_valid_event:
                 raise UpstreamError(
                     502,
-                    "upstream SSE stream ended before delivering any valid event",
+                    "upstream SSE stream ended before delivering any valid completion event",
                     backend.name,
                     retryable=True,
                     error_type="upstream_protocol_error",
@@ -1524,19 +1568,25 @@ def _openai_stream_error_sse(message: str) -> bytes:
 
 async def rewrite_stream_model(byte_iter: AsyncIterator[bytes], model_name: str) -> AsyncIterator[bytes]:
     """Rewrite upstream OpenAI SSE chunks to the requested model name with full
-    LF/CRLF framing and strict completion/premature-EOF/error integrity."""
+    LF/CRLF framing and strict completion/premature-EOF/error integrity.
+
+    Terminal-marker policy: `[DONE]` terminates the stream once real completion
+    evidence has been observed; trailing frames/bytes after `[DONE]` are ignored.
+    Metadata/usage-only streams without completion evidence never emit `[DONE]`.
+    """
     buf = b""
-    saw_data_event = False
+    saw_completion_evidence = False
     saw_finish_reason = False
     saw_done = False
     saw_upstream_error = False
     stream_error: str | None = None
+    pending_frames: list[bytes] = []
 
     def _process_events(events: list[tuple[str, str]]) -> list[bytes]:
-        nonlocal saw_data_event, saw_finish_reason, saw_done, saw_upstream_error, stream_error
+        nonlocal saw_completion_evidence, saw_finish_reason, saw_done, saw_upstream_error, stream_error
         out: list[bytes] = []
         for event_type, data_str in events:
-            if saw_upstream_error or stream_error is not None:
+            if saw_done or saw_upstream_error or stream_error is not None:
                 return out
             if event_type.strip().lower() == "error":
                 try:
@@ -1557,12 +1607,12 @@ async def rewrite_stream_model(byte_iter: AsyncIterator[bytes], model_name: str)
                 saw_upstream_error = True
                 return out
             if data_str == "[DONE]":
-                if not saw_data_event:
+                if not saw_completion_evidence:
                     stream_error = "upstream SSE stream sent done marker without completion data"
                     return out
                 saw_done = True
                 out.append(b"data: [DONE]\n\n")
-                continue
+                return out
             try:
                 obj = json.loads(data_str)
             except json.JSONDecodeError as exc:
@@ -1580,45 +1630,65 @@ async def rewrite_stream_model(byte_iter: AsyncIterator[bytes], model_name: str)
             if not _is_valid_openai_sse_chunk(obj):
                 stream_error = "upstream SSE stream sent unrecognized event schema"
                 return out
-            saw_data_event = True
+            has_evidence = _has_openai_completion_evidence(obj)
             for ch in obj.get("choices") or []:
-                if isinstance(ch, dict) and ch.get("finish_reason"):
-                    saw_finish_reason = True
+                if isinstance(ch, dict):
+                    finish = ch.get("finish_reason")
+                    if isinstance(finish, str) and finish.strip():
+                        saw_finish_reason = True
             if "model" in obj:
                 obj["model"] = model_name
             payload = json.dumps(obj).encode("utf-8")
             prefix = f"event: {event_type}\n".encode("utf-8") if event_type != "message" else b""
-            out.append(prefix + b"data: " + payload + b"\n\n")
+            frame = prefix + b"data: " + payload + b"\n\n"
+            if saw_completion_evidence:
+                out.append(frame)
+            elif has_evidence:
+                saw_completion_evidence = True
+                if pending_frames:
+                    out.extend(pending_frames)
+                    pending_frames.clear()
+                out.append(frame)
+            else:
+                pending_frames.append(frame)
         return out
 
     try:
-        async for chunk in byte_iter:
-            if not chunk:
-                continue
-            buf += chunk
-            events, buf = parse_sse_blocks(buf)
-            for frame in _process_events(events):
+        try:
+            async for chunk in byte_iter:
+                if not chunk:
+                    continue
+                buf += chunk
+                events, buf = parse_sse_blocks(buf)
+                for frame in _process_events(events):
+                    yield frame
+                if stream_error is not None or saw_upstream_error or saw_done:
+                    break
+        except Exception as exc:
+            stream_error = f"upstream stream interrupted ({type(exc).__name__}): {exc}"
+
+        if stream_error is None and not saw_upstream_error and not saw_done:
+            final_events, buf = parse_sse_blocks(buf, final=True)
+            for frame in _process_events(final_events):
                 yield frame
-            if stream_error is not None or saw_upstream_error:
-                break
-    except Exception as exc:
-        stream_error = f"upstream stream interrupted ({type(exc).__name__}): {exc}"
 
-    if stream_error is None and not saw_upstream_error:
-        final_events, buf = parse_sse_blocks(buf, final=True)
-        for frame in _process_events(final_events):
-            yield frame
+        if stream_error is None and not saw_upstream_error and not saw_done:
+            if _has_unparsed_sse_tail(buf):
+                stream_error = "upstream SSE stream ended with unterminated trailing data"
+            elif not saw_completion_evidence:
+                stream_error = "upstream SSE stream ended without completion data"
+            elif not saw_finish_reason:
+                stream_error = "upstream SSE stream ended prematurely without terminal finish or done marker"
 
-    if stream_error is None and not saw_upstream_error:
-        if _has_unparsed_sse_tail(buf):
-            stream_error = "upstream SSE stream ended with unterminated trailing data"
-        elif not saw_data_event:
-            stream_error = "upstream SSE stream was empty"
-        elif not (saw_finish_reason or saw_done):
-            stream_error = "upstream SSE stream ended prematurely without terminal finish or done marker"
-
-    if stream_error is not None and not saw_upstream_error:
-        yield _openai_stream_error_sse(stream_error)
+        if stream_error is not None and not saw_upstream_error:
+            yield _openai_stream_error_sse(stream_error)
+    finally:
+        aclose = getattr(byte_iter, "aclose", None)
+        if callable(aclose):
+            try:
+                await aclose()
+            except Exception:
+                pass
 
 
 def _alfred_models_list():
@@ -2055,9 +2125,16 @@ def _sse(event: str, data: dict[str, Any]) -> bytes:
 
 async def openai_stream_to_anthropic(byte_iter: AsyncIterator[bytes], model_name: str) -> AsyncIterator[bytes]:
     """Translate an OpenAI SSE byte stream to Anthropic Messages SSE with full
-    LF/CRLF framing and distinct success vs error finalization."""
+    LF/CRLF framing and distinct success vs error finalization.
+
+    Terminal-marker policy: `[DONE]` terminates the stream once real completion
+    evidence has been observed; trailing frames/bytes after `[DONE]` are ignored.
+    Metadata/usage-only streams without completion evidence never emit
+    `message_start`, `message_delta`, or `message_stop`.
+    """
     msg_id = "msg_" + uuid.uuid4().hex[:24]
     started = False
+    saw_completion_evidence = False
     saw_finish_reason = False
     saw_done = False
     upstream_error_obj: dict[str, Any] | None = None
@@ -2074,12 +2151,12 @@ async def openai_stream_to_anthropic(byte_iter: AsyncIterator[bytes], model_name
     buf = b""
 
     def _process_events(events: list[tuple[str, str]]) -> list[bytes]:
-        nonlocal started, saw_finish_reason, saw_done, upstream_error_obj, stream_error
+        nonlocal started, saw_completion_evidence, saw_finish_reason, saw_done, upstream_error_obj, stream_error
         nonlocal text_block_open, text_block_idx, reasoning_block_open, reasoning_block_idx
         nonlocal next_block_idx, stop_reason, input_tokens, output_tokens
         out: list[bytes] = []
         for event_type, data_str in events:
-            if upstream_error_obj is not None or stream_error is not None:
+            if saw_done or upstream_error_obj is not None or stream_error is not None:
                 return out
             if event_type.strip().lower() == "error":
                 try:
@@ -2095,11 +2172,11 @@ async def openai_stream_to_anthropic(byte_iter: AsyncIterator[bytes], model_name
                     }
                 return out
             if data_str == "[DONE]":
-                if not started:
+                if not saw_completion_evidence:
                     stream_error = "upstream SSE stream sent done marker without completion data"
                     return out
                 saw_done = True
-                continue
+                return out
             try:
                 evt = json.loads(data_str)
             except json.JSONDecodeError as exc:
@@ -2115,16 +2192,18 @@ async def openai_stream_to_anthropic(byte_iter: AsyncIterator[bytes], model_name
             if not _is_valid_openai_sse_chunk(evt):
                 stream_error = "upstream SSE stream sent unrecognized event schema"
                 return out
-            if not started:
+            usage_chunk = evt.get("usage")
+            if isinstance(usage_chunk, dict):
+                input_tokens = usage_chunk.get("prompt_tokens", input_tokens)
+                output_tokens = usage_chunk.get("completion_tokens", output_tokens)
+            if _has_openai_completion_evidence(evt):
+                saw_completion_evidence = True
+            if saw_completion_evidence and not started:
                 started = True
                 out.append(_sse("message_start", {"type": "message_start", "message": {
                     "id": msg_id, "type": "message", "role": "assistant", "content": [],
                     "model": model_name, "stop_reason": None, "stop_sequence": None,
                     "usage": {"input_tokens": 0, "output_tokens": 0}}}))
-            usage_chunk = evt.get("usage")
-            if isinstance(usage_chunk, dict):
-                input_tokens = usage_chunk.get("prompt_tokens", input_tokens)
-                output_tokens = usage_chunk.get("completion_tokens", output_tokens)
             choices = evt.get("choices") or []
             if not choices:
                 continue
@@ -2190,57 +2269,65 @@ async def openai_stream_to_anthropic(byte_iter: AsyncIterator[bytes], model_name
                     out.append(_sse("content_block_delta", {"type": "content_block_delta",
                                     "index": tool_blocks[tc_key]["block_idx"],
                                     "delta": {"type": "input_json_delta", "partial_json": fn["arguments"]}}))
-            if finish:
+            if isinstance(finish, str) and finish.strip():
                 saw_finish_reason = True
                 stop_reason = _FINISH_TO_STOP.get(finish, "end_turn")
         return out
 
     try:
-        async for chunk in byte_iter:
-            if not chunk:
-                continue
-            buf += chunk
-            events, buf = parse_sse_blocks(buf)
-            for frame in _process_events(events):
+        try:
+            async for chunk in byte_iter:
+                if not chunk:
+                    continue
+                buf += chunk
+                events, buf = parse_sse_blocks(buf)
+                for frame in _process_events(events):
+                    yield frame
+                if stream_error is not None or upstream_error_obj is not None or saw_done:
+                    break
+        except Exception as exc:
+            stream_error = f"upstream stream interrupted ({type(exc).__name__}): {exc}"
+
+        if stream_error is None and upstream_error_obj is None and not saw_done:
+            final_events, buf = parse_sse_blocks(buf, final=True)
+            for frame in _process_events(final_events):
                 yield frame
-            if stream_error is not None or upstream_error_obj is not None:
-                break
-    except Exception as exc:
-        stream_error = f"upstream stream interrupted ({type(exc).__name__}): {exc}"
 
-    if stream_error is None and upstream_error_obj is None:
-        final_events, buf = parse_sse_blocks(buf, final=True)
-        for frame in _process_events(final_events):
-            yield frame
+        if stream_error is None and upstream_error_obj is None and not saw_done:
+            if _has_unparsed_sse_tail(buf):
+                stream_error = "upstream SSE stream ended with unterminated trailing data"
+            elif not saw_completion_evidence:
+                stream_error = "upstream SSE stream ended without completion data"
+            elif not saw_finish_reason:
+                stream_error = "upstream SSE stream ended prematurely without finish marker"
 
-    if stream_error is None and upstream_error_obj is None:
-        if _has_unparsed_sse_tail(buf):
-            stream_error = "upstream SSE stream ended with unterminated trailing data"
-        elif not started:
-            stream_error = "upstream SSE stream was empty"
-        elif not (saw_finish_reason or saw_done):
-            stream_error = "upstream SSE stream ended prematurely without finish marker"
+        if upstream_error_obj is not None:
+            # Distinct error finalization preserving upstream error: NEVER emit message_delta/end_turn or message_stop.
+            yield _sse("error", {"type": "error", "error": upstream_error_obj})
+            return
 
-    if upstream_error_obj is not None:
-        # Distinct error finalization preserving upstream error: NEVER emit message_delta/end_turn or message_stop.
-        yield _sse("error", {"type": "error", "error": upstream_error_obj})
-        return
+        if stream_error is not None:
+            # Distinct error finalization: NEVER emit message_delta/end_turn or message_stop.
+            yield _sse("error", {"type": "error", "error": {"type": "api_error", "message": stream_error}})
+            return
 
-    if stream_error is not None:
-        # Distinct error finalization: NEVER emit message_delta/end_turn or message_stop.
-        yield _sse("error", {"type": "error", "error": {"type": "api_error", "message": stream_error}})
-        return
-
-    if reasoning_block_open:
-        yield _sse("content_block_stop", {"type": "content_block_stop", "index": reasoning_block_idx})
-    if text_block_open:
-        yield _sse("content_block_stop", {"type": "content_block_stop", "index": text_block_idx})
-    for tb in tool_blocks.values():
-        yield _sse("content_block_stop", {"type": "content_block_stop", "index": tb["block_idx"]})
-    yield _sse("message_delta", {"type": "message_delta",
-               "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-               "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}})
-    yield _sse("message_stop", {"type": "message_stop"})
+        if reasoning_block_open:
+            yield _sse("content_block_stop", {"type": "content_block_stop", "index": reasoning_block_idx})
+        if text_block_open:
+            yield _sse("content_block_stop", {"type": "content_block_stop", "index": text_block_idx})
+        for tb in tool_blocks.values():
+            yield _sse("content_block_stop", {"type": "content_block_stop", "index": tb["block_idx"]})
+        yield _sse("message_delta", {"type": "message_delta",
+                   "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                   "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}})
+        yield _sse("message_stop", {"type": "message_stop"})
+    finally:
+        aclose = getattr(byte_iter, "aclose", None)
+        if callable(aclose):
+            try:
+                await aclose()
+            except Exception:
+                pass
 
 
 @app.post("/v1/messages")

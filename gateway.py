@@ -154,6 +154,33 @@ def _get_bool(key: str, env: str, default: bool) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _parse_strict_bool(value: Any, *, field_name: str) -> bool:
+    """Require an actual Python bool; reject string booleans like 'false' and ints."""
+    if isinstance(value, bool):
+        return value
+    raise ValueError(
+        f"{field_name} must be a boolean (true/false), got {type(value).__name__}: {value!r}"
+    )
+
+
+def _get_strict_bool(key: str, env: str, default: bool) -> bool:
+    """Resolve a security-sensitive boolean setting without truthy-string coercion.
+
+    Environment variables accept only explicit boolean literals; YAML config
+    values must be native booleans (quoted 'false'/'true' strings are rejected).
+    """
+    if env in os.environ:
+        raw = os.environ[env].strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        if raw in ("0", "false", "no", "off", ""):
+            return False
+        raise ValueError(f"{env} must be a boolean value, got {os.environ[env]!r}")
+    if key in _CFG:
+        return _parse_strict_bool(_CFG[key], field_name=key)
+    return default
+
+
 def _get_int(key: str, env: str, default: int) -> int:
     try:
         return int(_get(key, env, default))
@@ -260,9 +287,34 @@ def _is_loopback_host(host: str | None) -> bool:
         return False
 
 
+VALID_TRUST_BOUNDARIES: frozenset[str] = frozenset({"local", "external"})
+
+
 def _infer_trust_boundary(base_url: str) -> str:
     parsed = urllib.parse.urlparse(base_url if "://" in base_url else f"http://{base_url}")
     return "local" if _is_loopback_host(parsed.hostname) else "external"
+
+
+def _validate_trust_boundary(raw: Any, base_url: str) -> str:
+    """Validate and canonicalize a backend trust_boundary value.
+
+    Empty/omitted values are inferred from base_url ('local' for loopback,
+    'external' otherwise). Explicit values must be strings matching the
+    canonical enum ('local' or 'external', case-insensitive); any other type
+    or unknown label fails closed with ValueError.
+    """
+    if raw is None or raw == "":
+        return _infer_trust_boundary(base_url)
+    if not isinstance(raw, str):
+        raise ValueError(
+            f"trust_boundary must be a string ('local' or 'external'), got {type(raw).__name__}"
+        )
+    normalized = raw.strip().lower()
+    if normalized not in VALID_TRUST_BOUNDARIES:
+        raise ValueError(
+            f"invalid trust_boundary {raw!r}: must be 'local' or 'external'"
+        )
+    return normalized
 
 
 def _parse_status_code_set(raw: Any) -> frozenset[int]:
@@ -300,7 +352,7 @@ def _parse_string_set(raw: Any) -> frozenset[str]:
 RETRYABLE_4XX_STATUSES: frozenset[int] = _parse_status_code_set(
     _get("retryable_4xx_statuses", "RETRYABLE_4XX_STATUSES", "")
 )
-ALLOW_EXTERNAL_FALLBACK: bool = _get_bool(
+ALLOW_EXTERNAL_FALLBACK: bool = _get_strict_bool(
     "allow_external_fallback", "ALLOW_EXTERNAL_FALLBACK", False
 )
 EXTERNAL_FALLBACK_ROUTES: frozenset[str] = _parse_string_set(
@@ -334,8 +386,11 @@ class Backend:
     allow_external_fallback: bool = False
 
     def __post_init__(self) -> None:
-        if not self.trust_boundary:
-            self.trust_boundary = _infer_trust_boundary(self.base_url)
+        self.trust_boundary = _validate_trust_boundary(self.trust_boundary, self.base_url)
+        self.allow_external_fallback = _parse_strict_bool(
+            self.allow_external_fallback,
+            field_name=f"backend {self.name!r} allow_external_fallback",
+        )
 
 
 QWEN397B_MODEL_PATH = str(_get("qwen397b_model_path", "QWEN397B_MODEL_PATH", "qwen3.5-397b-6bit"))
@@ -397,23 +452,39 @@ def _default_alfred_backends() -> dict[str, Backend]:
 
 def _backends_from_config() -> dict[str, Backend]:
     raw = _CFG.get("backends")
-    if not isinstance(raw, list):
+    if raw is None:
         return _default_alfred_backends()
+    if not isinstance(raw, list):
+        raise ValueError(f"backends config must be a list, got {type(raw).__name__}")
     out: dict[str, Backend] = {}
-    for b in raw:
-        if not isinstance(b, dict) or "name" not in b:
-            continue
+    for idx, b in enumerate(raw):
+        if not isinstance(b, dict):
+            raise ValueError(f"backends[{idx}] must be a mapping, got {type(b).__name__}")
+        name = b.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"backends[{idx}] requires a non-empty string 'name'")
+        base_url = b.get("base_url")
+        if not isinstance(base_url, str) or not base_url.strip():
+            raise ValueError(f"backend {name!r} requires a non-empty string 'base_url'")
         api_key = b.get("api_key", "not-needed")
         if isinstance(api_key, str) and api_key.startswith("env:"):
             api_key = os.environ.get(api_key[4:], "")
-        out[b["name"]] = Backend(
-            name=b["name"],
-            base_url=b["base_url"],
-            upstream_model=b.get("upstream_model", b["name"]),
+        trust_boundary = _validate_trust_boundary(b.get("trust_boundary"), base_url)
+        if "allow_external_fallback" in b:
+            allow_external = _parse_strict_bool(
+                b["allow_external_fallback"],
+                field_name=f"backend {name!r} allow_external_fallback",
+            )
+        else:
+            allow_external = False
+        out[name] = Backend(
+            name=name,
+            base_url=base_url,
+            upstream_model=b.get("upstream_model", name),
             api_key=api_key,
             extra_headers=b.get("extra_headers", {}) or {},
-            trust_boundary=str(b.get("trust_boundary", "") or ""),
-            allow_external_fallback=bool(b.get("allow_external_fallback", False)),
+            trust_boundary=trust_boundary,
+            allow_external_fallback=allow_external,
         )
     return out or _default_alfred_backends()
 
@@ -917,9 +988,9 @@ def forwarded_headers(request: Request) -> dict[str, str]:
 
 def _external_fallback_allowed(model_name: str, candidate: Backend) -> bool:
     return (
-        ALLOW_EXTERNAL_FALLBACK
+        ALLOW_EXTERNAL_FALLBACK is True
         or model_name in EXTERNAL_FALLBACK_ROUTES
-        or candidate.allow_external_fallback
+        or candidate.allow_external_fallback is True
     )
 
 
@@ -927,14 +998,16 @@ def resolve_chain(model_name: str) -> list[Backend]:
     if model_name not in BACKENDS:
         raise HTTPException(status_code=400, detail=f"Unknown model: {model_name}")
     primary = BACKENDS[model_name]
+    primary_boundary = _validate_trust_boundary(primary.trust_boundary, primary.base_url)
     chain = [primary]
     for fb in FALLBACKS.get(model_name, []):
         if fb not in BACKENDS:
             continue
         candidate = BACKENDS[fb]
+        candidate_boundary = _validate_trust_boundary(candidate.trust_boundary, candidate.base_url)
         if (
-            primary.trust_boundary == "local"
-            and candidate.trust_boundary != "local"
+            primary_boundary == "local"
+            and candidate_boundary != "local"
             and not _external_fallback_allowed(model_name, candidate)
         ):
             log.warning(
@@ -1040,6 +1113,39 @@ def _has_unparsed_sse_tail(buf: bytes) -> bool:
             continue
         return True
     return False
+
+
+def _extract_sse_error(event_type: str, obj: dict[str, Any]) -> dict[str, Any] | None:
+    """Return a normalized error dict if an SSE event represents an upstream error.
+
+    Matches explicit `event: error` frames as well as JSON payloads containing a
+    non-null `"error"` field or `type == "error"`.
+    """
+    etype = (event_type or "").strip().lower()
+    raw_err = obj.get("error")
+    is_error = etype == "error" or obj.get("type") == "error" or raw_err is not None
+    if not is_error:
+        return None
+    if isinstance(raw_err, dict):
+        err_obj = dict(raw_err)
+        if not err_obj.get("message"):
+            err_obj["message"] = str(obj.get("message") or json.dumps(raw_err))
+        if not err_obj.get("type"):
+            err_obj["type"] = "upstream_stream_error"
+        return err_obj
+    if isinstance(raw_err, str) and raw_err.strip():
+        return {"type": "upstream_stream_error", "message": raw_err.strip()}
+    if raw_err is not None:
+        return {"type": "upstream_stream_error", "message": str(raw_err)}
+    msg = obj.get("message")
+    if isinstance(msg, str) and msg.strip():
+        return {"type": str(obj.get("type") or "upstream_stream_error"), "message": msg.strip()}
+    return {"type": "upstream_stream_error", "message": json.dumps(obj)}
+
+
+def _is_valid_openai_sse_chunk(evt: dict[str, Any]) -> bool:
+    """Return True if `evt` conforms to an OpenAI streaming completion/usage chunk."""
+    return isinstance(evt.get("choices"), list) or isinstance(evt.get("usage"), dict)
 
 
 @dataclass
@@ -1266,58 +1372,85 @@ async def _open_upstream_sse_stream(
             )
         content_type = (resp.headers.get("content-type") or "").lower()
         if "text/event-stream" in content_type:
-            raw_iter = resp.aiter_raw()
+            # Always consume decoded transport bytes (aiter_bytes) so upstream
+            # Content-Encoding (gzip/deflate/br) is transparently decompressed.
+            byte_iter = resp.aiter_bytes()
             buf = b""
             prefetched: list[bytes] = []
             found_valid_event = False
-            async for chunk in raw_iter:
-                if not chunk:
-                    continue
-                prefetched.append(chunk)
-                buf += chunk
-                events, buf = parse_sse_blocks(buf)
-                for _etype, data_str in events:
-                    if data_str == "[DONE]":
-                        raise UpstreamError(
-                            502,
-                            "upstream SSE stream ended with done marker before any completion event",
-                            backend.name,
-                            retryable=True,
-                            error_type="upstream_protocol_error",
-                        )
-                    try:
-                        evt = json.loads(data_str)
-                    except json.JSONDecodeError as exc:
-                        raise UpstreamError(
-                            502,
-                            f"upstream SSE stream sent malformed JSON event: {exc}",
-                            backend.name,
-                            retryable=True,
-                            error_type="upstream_protocol_error",
-                        ) from exc
-                    if not isinstance(evt, dict):
-                        raise UpstreamError(
-                            502,
-                            "upstream SSE stream event must be a JSON object",
-                            backend.name,
-                            retryable=True,
-                            error_type="upstream_protocol_error",
-                        )
-                    found_valid_event = True
-                    break
-                if found_valid_event:
-                    break
+            try:
+                async for chunk in byte_iter:
+                    if not chunk:
+                        continue
+                    prefetched.append(chunk)
+                    buf += chunk
+                    events, buf = parse_sse_blocks(buf)
+                    for etype, data_str in events:
+                        if etype.strip().lower() == "error":
+                            found_valid_event = True
+                            break
+                        if data_str == "[DONE]":
+                            raise UpstreamError(
+                                502,
+                                "upstream SSE stream ended with done marker before any completion event",
+                                backend.name,
+                                retryable=True,
+                                error_type="upstream_protocol_error",
+                            )
+                        try:
+                            evt = json.loads(data_str)
+                        except json.JSONDecodeError as exc:
+                            raise UpstreamError(
+                                502,
+                                f"upstream SSE stream sent malformed JSON event: {exc}",
+                                backend.name,
+                                retryable=True,
+                                error_type="upstream_protocol_error",
+                            ) from exc
+                        if not isinstance(evt, dict):
+                            raise UpstreamError(
+                                502,
+                                "upstream SSE stream event must be a JSON object",
+                                backend.name,
+                                retryable=True,
+                                error_type="upstream_protocol_error",
+                            )
+                        if _extract_sse_error(etype, evt) is None and not _is_valid_openai_sse_chunk(evt):
+                            raise UpstreamError(
+                                502,
+                                "upstream SSE stream event missing expected completion or error schema",
+                                backend.name,
+                                retryable=True,
+                                error_type="upstream_protocol_error",
+                            )
+                        found_valid_event = True
+                        break
+                    if found_valid_event:
+                        break
+            except httpx.DecodingError as exc:
+                raise UpstreamError(
+                    502,
+                    f"upstream SSE stream content-encoding decode failed: {exc}",
+                    backend.name,
+                    retryable=True,
+                    error_type="upstream_decoding_error",
+                ) from exc
             if not found_valid_event:
                 # Check final flush in case stream used CR-CR only without trailing chunk
                 final_events, _ = parse_sse_blocks(buf, final=True)
-                for _etype, data_str in final_events:
+                for etype, data_str in final_events:
+                    if etype.strip().lower() == "error":
+                        found_valid_event = True
+                        break
                     if data_str == "[DONE]":
                         break
                     try:
                         evt = json.loads(data_str)
                     except json.JSONDecodeError:
                         break
-                    if isinstance(evt, dict):
+                    if isinstance(evt, dict) and (
+                        _extract_sse_error(etype, evt) is not None or _is_valid_openai_sse_chunk(evt)
+                    ):
                         found_valid_event = True
                         break
             if not found_valid_event:
@@ -1338,7 +1471,7 @@ async def _open_upstream_sse_stream(
                 try:
                     for c in prefetched:
                         yield c
-                    async for c in raw_iter:
+                    async for c in byte_iter:
                         yield c
                 finally:
                     await owned_resp.aclose()
@@ -1391,17 +1524,38 @@ def _openai_stream_error_sse(message: str) -> bytes:
 
 async def rewrite_stream_model(byte_iter: AsyncIterator[bytes], model_name: str) -> AsyncIterator[bytes]:
     """Rewrite upstream OpenAI SSE chunks to the requested model name with full
-    LF/CRLF framing and strict completion/premature-EOF integrity."""
+    LF/CRLF framing and strict completion/premature-EOF/error integrity."""
     buf = b""
     saw_data_event = False
     saw_finish_reason = False
     saw_done = False
+    saw_upstream_error = False
     stream_error: str | None = None
 
     def _process_events(events: list[tuple[str, str]]) -> list[bytes]:
-        nonlocal saw_data_event, saw_finish_reason, saw_done, stream_error
+        nonlocal saw_data_event, saw_finish_reason, saw_done, saw_upstream_error, stream_error
         out: list[bytes] = []
         for event_type, data_str in events:
+            if saw_upstream_error or stream_error is not None:
+                return out
+            if event_type.strip().lower() == "error":
+                try:
+                    parsed = json.loads(data_str)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    err_obj = _extract_sse_error(event_type, parsed)
+                    err_payload = parsed if (parsed.get("error") is not None) else {"error": err_obj}
+                else:
+                    err_payload = {
+                        "error": {
+                            "type": "upstream_stream_error",
+                            "message": data_str or "upstream stream error",
+                        }
+                    }
+                out.append(b"event: error\ndata: " + json.dumps(err_payload).encode("utf-8") + b"\n\n")
+                saw_upstream_error = True
+                return out
             if data_str == "[DONE]":
                 if not saw_data_event:
                     stream_error = "upstream SSE stream sent done marker without completion data"
@@ -1416,6 +1570,15 @@ async def rewrite_stream_model(byte_iter: AsyncIterator[bytes], model_name: str)
                 return out
             if not isinstance(obj, dict):
                 stream_error = "non-object JSON event in upstream SSE stream"
+                return out
+            err_obj = _extract_sse_error(event_type, obj)
+            if err_obj is not None:
+                err_payload = obj if (obj.get("error") is not None) else {"error": err_obj}
+                out.append(b"event: error\ndata: " + json.dumps(err_payload).encode("utf-8") + b"\n\n")
+                saw_upstream_error = True
+                return out
+            if not _is_valid_openai_sse_chunk(obj):
+                stream_error = "upstream SSE stream sent unrecognized event schema"
                 return out
             saw_data_event = True
             for ch in obj.get("choices") or []:
@@ -1436,17 +1599,17 @@ async def rewrite_stream_model(byte_iter: AsyncIterator[bytes], model_name: str)
             events, buf = parse_sse_blocks(buf)
             for frame in _process_events(events):
                 yield frame
-            if stream_error is not None:
+            if stream_error is not None or saw_upstream_error:
                 break
     except Exception as exc:
         stream_error = f"upstream stream interrupted ({type(exc).__name__}): {exc}"
 
-    if stream_error is None:
+    if stream_error is None and not saw_upstream_error:
         final_events, buf = parse_sse_blocks(buf, final=True)
         for frame in _process_events(final_events):
             yield frame
 
-    if stream_error is None:
+    if stream_error is None and not saw_upstream_error:
         if _has_unparsed_sse_tail(buf):
             stream_error = "upstream SSE stream ended with unterminated trailing data"
         elif not saw_data_event:
@@ -1454,7 +1617,7 @@ async def rewrite_stream_model(byte_iter: AsyncIterator[bytes], model_name: str)
         elif not (saw_finish_reason or saw_done):
             stream_error = "upstream SSE stream ended prematurely without terminal finish or done marker"
 
-    if stream_error is not None:
+    if stream_error is not None and not saw_upstream_error:
         yield _openai_stream_error_sse(stream_error)
 
 
@@ -1487,44 +1650,54 @@ async def _alfred_traced_stream(inner: AsyncIterator[bytes], span, model: str, s
     tool_call_count = 0
     saw_error = False
     buf = b""
+
+    def _inspect_events(events: list[tuple[str, str]]) -> None:
+        nonlocal input_tokens, output_tokens, tool_call_count, saw_error
+        for etype, data_str in events:
+            if etype.strip().lower() == "error":
+                saw_error = True
+                continue
+            if data_str == "[DONE]":
+                continue
+            try:
+                evt = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(evt, dict):
+                continue
+            if anthropic:
+                if evt.get("type") == "error" or evt.get("error") is not None:
+                    saw_error = True
+                    continue
+                # Anthropic message_delta carries usage; tool_use blocks count.
+                if evt.get("type") == "content_block_start" and \
+                        evt.get("content_block", {}).get("type") == "tool_use":
+                    tool_call_count += 1
+                usage = evt.get("usage") or evt.get("message", {}).get("usage")
+                if usage:
+                    input_tokens = usage.get("input_tokens", input_tokens)
+                    output_tokens = usage.get("output_tokens", output_tokens)
+            else:
+                if evt.get("type") == "error" or evt.get("error") is not None:
+                    saw_error = True
+                    continue
+                tool_call_count += _count_tool_calls_in_chunk(evt)
+                inp, out = _extract_usage(evt)
+                if inp > 0:
+                    input_tokens = inp
+                if out > 0:
+                    output_tokens = out
+
     try:
         async for chunk in inner:
             if TRACING_ENABLED:
                 buf += chunk
                 events, buf = parse_sse_blocks(buf)
-                for etype, data_str in events:
-                    if etype == "error":
-                        saw_error = True
-                        continue
-                    if data_str == "[DONE]":
-                        continue
-                    try:
-                        evt = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-                    if anthropic:
-                        if evt.get("type") == "error":
-                            saw_error = True
-                            continue
-                        # Anthropic message_delta carries usage; tool_use blocks count.
-                        if evt.get("type") == "content_block_start" and \
-                                evt.get("content_block", {}).get("type") == "tool_use":
-                            tool_call_count += 1
-                        usage = evt.get("usage") or evt.get("message", {}).get("usage")
-                        if usage:
-                            input_tokens = usage.get("input_tokens", input_tokens)
-                            output_tokens = usage.get("output_tokens", output_tokens)
-                    else:
-                        if "error" in evt and "choices" not in evt:
-                            saw_error = True
-                            continue
-                        tool_call_count += _count_tool_calls_in_chunk(evt)
-                        inp, out = _extract_usage(evt)
-                        if inp > 0:
-                            input_tokens = inp
-                        if out > 0:
-                            output_tokens = out
+                _inspect_events(events)
             yield chunk
+        if TRACING_ENABLED and buf:
+            final_events, buf = parse_sse_blocks(buf, final=True)
+            _inspect_events(final_events)
     except Exception:
         saw_error = True
         raise
@@ -1650,9 +1823,10 @@ async def chat_completions(request: Request, authorization: str | None = Header(
             last_err = e
             log.warning("rid=%s backend=%s retryable_status=%s type=%s", rid, e.backend, e.status, e.error_type)
             continue
-        except httpx.TransportError as e:
-            last_err = UpstreamError(503, str(e), backend.name, retryable=True, error_type=type(e).__name__)
-            attempts.append({"backend": backend.name, "status": 503, "error_type": type(e).__name__})
+        except (httpx.TransportError, httpx.DecodingError) as e:
+            status = 502 if isinstance(e, httpx.DecodingError) else 503
+            last_err = UpstreamError(status, str(e), backend.name, retryable=True, error_type=type(e).__name__)
+            attempts.append({"backend": backend.name, "status": status, "error_type": type(e).__name__})
             log.warning("rid=%s backend=%s transport_err=%s", rid, backend.name, type(e).__name__)
             continue
 
@@ -1886,6 +2060,7 @@ async def openai_stream_to_anthropic(byte_iter: AsyncIterator[bytes], model_name
     started = False
     saw_finish_reason = False
     saw_done = False
+    upstream_error_obj: dict[str, Any] | None = None
     stream_error: str | None = None
     text_block_open = False
     text_block_idx = -1
@@ -1899,11 +2074,26 @@ async def openai_stream_to_anthropic(byte_iter: AsyncIterator[bytes], model_name
     buf = b""
 
     def _process_events(events: list[tuple[str, str]]) -> list[bytes]:
-        nonlocal started, saw_finish_reason, saw_done, stream_error
+        nonlocal started, saw_finish_reason, saw_done, upstream_error_obj, stream_error
         nonlocal text_block_open, text_block_idx, reasoning_block_open, reasoning_block_idx
         nonlocal next_block_idx, stop_reason, input_tokens, output_tokens
         out: list[bytes] = []
-        for _event_type, data_str in events:
+        for event_type, data_str in events:
+            if upstream_error_obj is not None or stream_error is not None:
+                return out
+            if event_type.strip().lower() == "error":
+                try:
+                    parsed = json.loads(data_str)
+                except json.JSONDecodeError:
+                    parsed = None
+                if isinstance(parsed, dict):
+                    upstream_error_obj = _extract_sse_error(event_type, parsed)
+                else:
+                    upstream_error_obj = {
+                        "type": "api_error",
+                        "message": data_str or "upstream stream error",
+                    }
+                return out
             if data_str == "[DONE]":
                 if not started:
                     stream_error = "upstream SSE stream sent done marker without completion data"
@@ -1917,6 +2107,13 @@ async def openai_stream_to_anthropic(byte_iter: AsyncIterator[bytes], model_name
                 return out
             if not isinstance(evt, dict):
                 stream_error = "non-object JSON event in upstream SSE stream"
+                return out
+            err_obj = _extract_sse_error(event_type, evt)
+            if err_obj is not None:
+                upstream_error_obj = err_obj
+                return out
+            if not _is_valid_openai_sse_chunk(evt):
+                stream_error = "upstream SSE stream sent unrecognized event schema"
                 return out
             if not started:
                 started = True
@@ -2006,23 +2203,28 @@ async def openai_stream_to_anthropic(byte_iter: AsyncIterator[bytes], model_name
             events, buf = parse_sse_blocks(buf)
             for frame in _process_events(events):
                 yield frame
-            if stream_error is not None:
+            if stream_error is not None or upstream_error_obj is not None:
                 break
     except Exception as exc:
         stream_error = f"upstream stream interrupted ({type(exc).__name__}): {exc}"
 
-    if stream_error is None:
+    if stream_error is None and upstream_error_obj is None:
         final_events, buf = parse_sse_blocks(buf, final=True)
         for frame in _process_events(final_events):
             yield frame
 
-    if stream_error is None:
+    if stream_error is None and upstream_error_obj is None:
         if _has_unparsed_sse_tail(buf):
             stream_error = "upstream SSE stream ended with unterminated trailing data"
         elif not started:
             stream_error = "upstream SSE stream was empty"
         elif not (saw_finish_reason or saw_done):
             stream_error = "upstream SSE stream ended prematurely without finish marker"
+
+    if upstream_error_obj is not None:
+        # Distinct error finalization preserving upstream error: NEVER emit message_delta/end_turn or message_stop.
+        yield _sse("error", {"type": "error", "error": upstream_error_obj})
+        return
 
     if stream_error is not None:
         # Distinct error finalization: NEVER emit message_delta/end_turn or message_stop.
@@ -2146,9 +2348,10 @@ async def messages(request: Request, authorization: str | None = Header(default=
             last_err = e
             log.warning("rid=%s backend=%s retryable_status=%s type=%s", rid, e.backend, e.status, e.error_type)
             continue
-        except httpx.TransportError as e:
-            last_err = UpstreamError(503, str(e), backend.name, retryable=True, error_type=type(e).__name__)
-            attempts.append({"backend": backend.name, "status": 503, "error_type": type(e).__name__})
+        except (httpx.TransportError, httpx.DecodingError) as e:
+            status = 502 if isinstance(e, httpx.DecodingError) else 503
+            last_err = UpstreamError(status, str(e), backend.name, retryable=True, error_type=type(e).__name__)
+            attempts.append({"backend": backend.name, "status": status, "error_type": type(e).__name__})
             log.warning("rid=%s backend=%s transport_err=%s", rid, backend.name, type(e).__name__)
             continue
 

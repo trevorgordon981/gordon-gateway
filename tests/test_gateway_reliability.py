@@ -19,6 +19,7 @@ Covers:
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,7 @@ import sys
 from typing import Any, AsyncIterator
 import unittest
 from unittest.mock import AsyncMock, patch
+import zlib
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -162,7 +164,7 @@ class _FakeStreamResponse:
     async def aread(self) -> bytes:
         return self._body
 
-    async def aiter_raw(self) -> AsyncIterator[bytes]:
+    async def aiter_bytes(self) -> AsyncIterator[bytes]:
         for c in self._chunks:
             yield c
         if self._midstream_exc is not None:
@@ -170,6 +172,31 @@ class _FakeStreamResponse:
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+class _RecordingSpan:
+    def __init__(self) -> None:
+        self.attributes: dict[str, Any] = {}
+        self.ended: bool = False
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        self.attributes[key] = value
+
+    def end(self) -> None:
+        self.ended = True
+
+
+class _ChunkedAsyncByteStream(httpx.AsyncByteStream if _HAS_WEB_DEPS else object):
+    def __init__(self, payload: bytes, chunk_size: int = 11) -> None:
+        self._payload = payload
+        self._chunk_size = chunk_size
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for i in range(0, len(self._payload), self._chunk_size):
+            yield self._payload[i:i + self._chunk_size]
+
+    async def aclose(self) -> None:
+        return None
 
 
 class _FakePostResponse:
@@ -447,6 +474,242 @@ class SSEFramingAndCompletionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(reconstructed["_saw_message_stop"])
         self.assertEqual([{"type": "text", "text": "recovered"}], reconstructed["content"])
 
+    async def test_upstream_error_event_before_done_propagates_error_and_marks_span(self):
+        cases = [
+            (
+                "explicit_event_error_only",
+                b'event: error\r\ndata: {"error":{"type":"overloaded_error","message":"backend overloaded"}}\r\n\r\n'
+                b"data: [DONE]\r\n\r\n",
+                "backend overloaded",
+                "overloaded_error",
+            ),
+            (
+                "json_error_payload_only",
+                b'data: {"error":{"type":"rate_limit_error","message":"quota exceeded"}}\n\n'
+                b"data: [DONE]\n\n",
+                "quota exceeded",
+                "rate_limit_error",
+            ),
+            (
+                "midstream_event_error_then_done",
+                b'data: {"id":"c1","model":"up","choices":[{"index":0,"delta":{"content":"partial "},"finish_reason":null}]}\r\n\r\n'
+                b'event: error\r\ndata: {"error":{"type":"server_error","message":"midstream failure"}}\r\n\r\n'
+                b"data: [DONE]\r\n\r\n",
+                "midstream failure",
+                "server_error",
+            ),
+            (
+                "plain_text_event_error_then_done",
+                b"event: error\ndata: upstream crashed hard\n\n"
+                b"data: [DONE]\n\n",
+                "upstream crashed hard",
+                None,
+            ),
+        ]
+        for label, raw_sse, expected_msg, expected_type in cases:
+            with self.subTest(case=label):
+                # Direct translator checks: Anthropic
+                out_a = await _collect_stream(
+                    gateway.openai_stream_to_anthropic(_chunked_iter(raw_sse, 7), "req-model")
+                )
+                events_a = _parse_output_sse(out_a)
+                etypes_a = [et for et, _ in events_a]
+                self.assertEqual("error", etypes_a[-1])
+                self.assertNotIn("message_stop", etypes_a)
+                self.assertNotIn("message_delta", etypes_a)
+                self.assertNotIn(b"end_turn", out_a)
+                err_payload_a = json.loads(events_a[-1][1])
+                self.assertEqual("error", err_payload_a["type"])
+                self.assertIn(expected_msg, err_payload_a["error"]["message"])
+                if expected_type:
+                    self.assertEqual(expected_type, err_payload_a["error"]["type"])
+
+                # Direct translator checks: OpenAI
+                out_o = await _collect_stream(
+                    gateway.rewrite_stream_model(_chunked_iter(raw_sse, 7), "req-model")
+                )
+                events_o = _parse_output_sse(out_o)
+                etypes_o = [et for et, _ in events_o]
+                self.assertEqual("error", etypes_o[-1])
+                self.assertNotIn(b"[DONE]", out_o)
+                err_payload_o = json.loads(events_o[-1][1])
+                self.assertIn(expected_msg, err_payload_o["error"]["message"])
+                if expected_type:
+                    self.assertEqual(expected_type, err_payload_o["error"]["type"])
+
+                # End-to-end route + span verification (both /v1/messages and /v1/chat/completions)
+                backend = gateway.Backend("local-primary", "http://127.0.0.1:9001/v1", "up", "k")
+                for endpoint in ("/v1/messages", "/v1/chat/completions"):
+                    calls: list[dict[str, Any]] = []
+                    outcomes = {
+                        "http://127.0.0.1:9001/v1/chat/completions": _FakeStreamResponse(
+                            status_code=200,
+                            chunks=[raw_sse[:19], raw_sse[19:]],
+                        )
+                    }
+                    span = _RecordingSpan()
+                    req = _make_json_request(
+                        endpoint,
+                        {"model": "local-primary", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                    )
+                    with patch.object(gateway, "MODE", "alfred"), \
+                         patch.object(gateway, "MASTER_KEY", "secret"), \
+                         patch.object(gateway, "BACKENDS", {"local-primary": backend}), \
+                         patch.object(gateway, "FALLBACKS", {}), \
+                         patch.object(gateway, "TRACING_ENABLED", True), \
+                         patch.object(gateway, "_start_chat_span", return_value=span), \
+                         patch.object(gateway, "_record_metrics"), \
+                         patch.object(gateway, "verify_swap_in_loaded", AsyncMock(return_value=True)), \
+                         patch.object(gateway.httpx, "AsyncClient", _make_fake_httpx_client(outcomes, calls)):
+                        if endpoint == "/v1/messages":
+                            resp = await gateway.messages(req, authorization="Bearer secret", x_api_key=None)
+                        else:
+                            resp = await gateway.chat_completions(req, authorization="Bearer secret")
+                        self.assertEqual(200, resp.status_code)
+                        body = await _collect_stream(resp.body_iterator)
+                    events = _parse_output_sse(body)
+                    self.assertEqual("error", events[-1][0])
+                    self.assertIn(expected_msg.encode("utf-8"), body)
+                    self.assertNotIn(b"message_stop", body)
+                    self.assertNotIn(b"end_turn", body)
+                    self.assertNotIn(b"[DONE]", body)
+                    self.assertIs(True, span.attributes.get("error"), f"span must mark error=True on {endpoint}/{label}")
+                    self.assertTrue(span.ended)
+
+    async def test_unrecognized_sse_schema_before_done_never_reports_success(self):
+        raw = b'data: {"status":"unexpected_schema"}\n\ndata: [DONE]\n\n'
+        out_a = await _collect_stream(gateway.openai_stream_to_anthropic(_chunked_iter(raw, 5), "m"))
+        etypes_a = [et for et, _ in _parse_output_sse(out_a)]
+        self.assertEqual("error", etypes_a[-1])
+        self.assertNotIn("message_stop", etypes_a)
+        self.assertNotIn(b"end_turn", out_a)
+
+        out_o = await _collect_stream(gateway.rewrite_stream_model(_chunked_iter(raw, 5), "m"))
+        etypes_o = [et for et, _ in _parse_output_sse(out_o)]
+        self.assertEqual("error", etypes_o[-1])
+        self.assertNotIn(b"[DONE]", out_o)
+
+    async def test_compressed_gzip_and_deflate_sse_decodes_cleanly_via_real_httpx_transport(self):
+        raw_sse = self._build_full_sse(b"\r\n")
+        encodings = [
+            ("gzip", gzip.compress(raw_sse)),
+            ("deflate", zlib.compress(raw_sse)),
+        ]
+        backend = gateway.Backend("local-primary", "http://127.0.0.1:9001/v1", "upstream-model", "k")
+
+        for encoding, compressed_bytes in encodings:
+            for endpoint in ("/v1/messages", "/v1/chat/completions"):
+                with self.subTest(content_encoding=encoding, endpoint=endpoint):
+                    def make_handler(enc: str, payload: bytes):
+                        def _handler(_request: httpx.Request) -> httpx.Response:
+                            return httpx.Response(
+                                status_code=200,
+                                headers={
+                                    "content-type": "text/event-stream",
+                                    "content-encoding": enc,
+                                },
+                                stream=_ChunkedAsyncByteStream(payload, chunk_size=13),
+                            )
+                        return _handler
+
+                    transport = httpx.MockTransport(make_handler(encoding, compressed_bytes))
+                    real_async_client = httpx.AsyncClient
+
+                    def _client_factory(*args, **kwargs):
+                        kwargs["transport"] = transport
+                        return real_async_client(*args, **kwargs)
+
+                    req = _make_json_request(
+                        endpoint,
+                        {"model": "local-primary", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                    )
+                    with patch.object(gateway, "MODE", "alfred"), \
+                         patch.object(gateway, "MASTER_KEY", "secret"), \
+                         patch.object(gateway, "BACKENDS", {"local-primary": backend}), \
+                         patch.object(gateway, "FALLBACKS", {}), \
+                         patch.object(gateway, "TRACING_ENABLED", False), \
+                         patch.object(gateway, "verify_swap_in_loaded", AsyncMock(return_value=True)), \
+                         patch.object(gateway.httpx, "AsyncClient", side_effect=_client_factory):
+                        if endpoint == "/v1/messages":
+                            resp = await gateway.messages(req, authorization="Bearer secret", x_api_key=None)
+                        else:
+                            resp = await gateway.chat_completions(req, authorization="Bearer secret")
+                        self.assertEqual(200, resp.status_code)
+                        body = await _collect_stream(resp.body_iterator)
+
+                    if endpoint == "/v1/messages":
+                        reconstructed = _reconstruct_anthropic_from_sse(body)
+                        self.assertTrue(reconstructed["_saw_message_stop"])
+                        self.assertEqual("tool_use", reconstructed["stop_reason"])
+                        self.assertEqual(
+                            [
+                                {"type": "thinking", "thinking": "step 1"},
+                                {"type": "text", "text": "hello world"},
+                                {"type": "tool_use", "id": "call_abc", "name": "lookup", "input": {"sym": "AAPL"}},
+                            ],
+                            reconstructed["content"],
+                        )
+                    else:
+                        events = _parse_output_sse(body)
+                        self.assertEqual("[DONE]", events[-1][1])
+                        self.assertNotIn("error", [et for et, _ in events])
+                        objs = [json.loads(d) for _, d in events[:-1]]
+                        self.assertTrue(all(o["model"] == "local-primary" for o in objs))
+                        self.assertEqual(
+                            "hello world",
+                            "".join(o["choices"][0]["delta"].get("content", "") for o in objs),
+                        )
+
+    async def test_corrupt_gzip_sse_fails_over_before_http_200_commit(self):
+        primary = gateway.Backend("local-primary", "http://127.0.0.1:9001/v1", "p-model", "k")
+        backup = gateway.Backend("local-backup", "http://127.0.0.1:9002/v1", "b-model", "k")
+        good_gzip = gzip.compress(
+            b'data: {"id":"c2","model":"b-model","choices":[{"index":0,"delta":{"content":"decoded-backup"},"finish_reason":"stop"}]}\r\n\r\n'
+            b"data: [DONE]\r\n\r\n"
+        )
+        seen_urls: list[str] = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            seen_urls.append(str(request.url))
+            if "9001" in str(request.url):
+                return httpx.Response(
+                    status_code=200,
+                    headers={"content-type": "text/event-stream", "content-encoding": "gzip"},
+                    stream=_ChunkedAsyncByteStream(b"not-valid-gzip-wire-bytes", chunk_size=7),
+                )
+            return httpx.Response(
+                status_code=200,
+                headers={"content-type": "text/event-stream", "content-encoding": "gzip"},
+                stream=_ChunkedAsyncByteStream(good_gzip, chunk_size=9),
+            )
+
+        transport = httpx.MockTransport(_handler)
+        real_async_client = httpx.AsyncClient
+
+        def _client_factory(*args, **kwargs):
+            kwargs["transport"] = transport
+            return real_async_client(*args, **kwargs)
+
+        req = _make_json_request(
+            "/v1/messages",
+            {"model": "local-primary", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+        )
+        with patch.object(gateway, "MODE", "alfred"), \
+             patch.object(gateway, "MASTER_KEY", "secret"), \
+             patch.object(gateway, "BACKENDS", {"local-primary": primary, "local-backup": backup}), \
+             patch.object(gateway, "FALLBACKS", {"local-primary": ["local-backup"]}), \
+             patch.object(gateway, "TRACING_ENABLED", False), \
+             patch.object(gateway, "verify_swap_in_loaded", AsyncMock(return_value=True)), \
+             patch.object(gateway.httpx, "AsyncClient", side_effect=_client_factory):
+            resp = await gateway.messages(req, authorization="Bearer secret", x_api_key=None)
+            self.assertEqual(200, resp.status_code)
+            body = await _collect_stream(resp.body_iterator)
+
+        self.assertEqual(2, len(seen_urls))
+        reconstructed = _reconstruct_anthropic_from_sse(body)
+        self.assertTrue(reconstructed["_saw_message_stop"])
+        self.assertEqual([{"type": "text", "text": "decoded-backup"}], reconstructed["content"])
+
 
 # ===========================================================================
 # GW-02 & GW-03: Retry policy, 4xx terminal default, data-boundary, ConnectTimeout & malformed 200
@@ -573,6 +836,126 @@ class RetryAndFailoverPolicyTests(unittest.IsolatedAsyncioTestCase):
             resp2 = await gateway.chat_completions(req2, authorization="Bearer secret")
         self.assertEqual(200, resp2.status_code)
         self.assertEqual(2, len(calls))
+
+    def test_strict_config_rejects_string_booleans_and_normalizes_or_rejects_trust_boundaries(self):
+        # 1. Quoted string booleans (e.g. "false") and non-bool types MUST fail closed with ValueError.
+        for bad_bool in ("false", "true", "0", "1", 0, 1, None, ["false"]):
+            with self.subTest(bad_bool=bad_bool):
+                with self.assertRaises(ValueError):
+                    gateway.Backend(
+                        "backup",
+                        "https://external.example/v1",
+                        "c-model",
+                        "k",
+                        trust_boundary="external",
+                        allow_external_fallback=bad_bool,  # type: ignore[arg-type]
+                    )
+                cfg = {
+                    "backends": [
+                        {
+                            "name": "local",
+                            "base_url": "http://127.0.0.1:9001/v1",
+                            "trust_boundary": "local",
+                        },
+                        {
+                            "name": "backup",
+                            "base_url": "https://external.example/v1",
+                            "trust_boundary": "external",
+                            "allow_external_fallback": bad_bool,
+                        },
+                    ]
+                }
+                with patch.object(gateway, "_CFG", cfg):
+                    with self.assertRaises(ValueError):
+                        gateway._backends_from_config()
+
+        # Top-level YAML allow_external_fallback must also reject string booleans & invalid env values.
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ALLOW_EXTERNAL_FALLBACK", None)
+            with patch.object(gateway, "_CFG", {"allow_external_fallback": "false"}):
+                with self.assertRaises(ValueError):
+                    gateway._get_strict_bool("allow_external_fallback", "ALLOW_EXTERNAL_FALLBACK", False)
+        with patch.dict(os.environ, {"ALLOW_EXTERNAL_FALLBACK": "maybe"}, clear=False):
+            with self.assertRaises(ValueError):
+                gateway._get_strict_bool("allow_external_fallback", "ALLOW_EXTERNAL_FALLBACK", False)
+        with patch.dict(os.environ, {"ALLOW_EXTERNAL_FALLBACK": "false"}, clear=False):
+            self.assertIs(False, gateway._get_strict_bool("allow_external_fallback", "ALLOW_EXTERNAL_FALLBACK", True))
+
+        # 2. Mixed-case trust_boundary ('LOCAL', 'External') normalizes cleanly and NEVER bypasses guard.
+        cfg_mixed = {
+            "backends": [
+                {
+                    "name": "local",
+                    "base_url": "http://127.0.0.1:9001/v1",
+                    "trust_boundary": "LOCAL",
+                    "allow_external_fallback": False,
+                },
+                {
+                    "name": "backup",
+                    "base_url": "https://external.example/v1",
+                    "trust_boundary": "External",
+                    "allow_external_fallback": False,
+                },
+            ]
+        }
+        with patch.object(gateway, "_CFG", cfg_mixed):
+            parsed_backends = gateway._backends_from_config()
+        self.assertEqual("local", parsed_backends["local"].trust_boundary)
+        self.assertEqual("external", parsed_backends["backup"].trust_boundary)
+
+        with patch.object(gateway, "BACKENDS", parsed_backends), \
+             patch.object(gateway, "FALLBACKS", {"local": ["backup"]}), \
+             patch.object(gateway, "ALLOW_EXTERNAL_FALLBACK", False), \
+             patch.object(gateway, "EXTERNAL_FALLBACK_ROUTES", frozenset()):
+            self.assertEqual(["local"], [b.name for b in gateway.resolve_chain("local")])
+
+        # Defense-in-depth: even post-construction mutation cannot bypass resolve_chain guard.
+        parsed_backends["local"].trust_boundary = "LOCAL"
+        parsed_backends["backup"].allow_external_fallback = "false"  # type: ignore[assignment]
+        with patch.object(gateway, "BACKENDS", parsed_backends), \
+             patch.object(gateway, "FALLBACKS", {"local": ["backup"]}), \
+             patch.object(gateway, "ALLOW_EXTERNAL_FALLBACK", False), \
+             patch.object(gateway, "EXTERNAL_FALLBACK_ROUTES", frozenset()):
+            self.assertEqual(["local"], [b.name for b in gateway.resolve_chain("local")])
+
+        # 3. Unknown or non-string trust_boundary labels MUST fail closed with ValueError.
+        for bad_boundary in ("dmz", "private", "cloud", "lan", 123, ["local"]):
+            with self.subTest(bad_boundary=bad_boundary):
+                with self.assertRaises(ValueError):
+                    gateway.Backend(
+                        "local",
+                        "http://127.0.0.1:9001/v1",
+                        "p-model",
+                        "k",
+                        trust_boundary=bad_boundary,  # type: ignore[arg-type]
+                    )
+                with patch.object(
+                    gateway,
+                    "_CFG",
+                    {"backends": [{"name": "local", "base_url": "http://127.0.0.1:9001/v1", "trust_boundary": bad_boundary}]},
+                ):
+                    with self.assertRaises(ValueError):
+                        gateway._backends_from_config()
+
+        # 4. Typed boolean allow_external_fallback=True still explicitly authorizes external hop.
+        cfg_allowed = {
+            "backends": [
+                {"name": "local", "base_url": "http://127.0.0.1:9001/v1", "trust_boundary": "local"},
+                {
+                    "name": "backup",
+                    "base_url": "https://external.example/v1",
+                    "trust_boundary": "external",
+                    "allow_external_fallback": True,
+                },
+            ]
+        }
+        with patch.object(gateway, "_CFG", cfg_allowed):
+            allowed_backends = gateway._backends_from_config()
+        with patch.object(gateway, "BACKENDS", allowed_backends), \
+             patch.object(gateway, "FALLBACKS", {"local": ["backup"]}), \
+             patch.object(gateway, "ALLOW_EXTERNAL_FALLBACK", False), \
+             patch.object(gateway, "EXTERNAL_FALLBACK_ROUTES", frozenset()):
+            self.assertEqual(["local", "backup"], [b.name for b in gateway.resolve_chain("local")])
 
     async def test_connect_timeout_and_malformed_200_trigger_failover(self):
         primary = gateway.Backend("local-primary", "http://127.0.0.1:9001/v1", "p-model", "k")

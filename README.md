@@ -53,7 +53,10 @@ flowchart LR
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-# Optional extras (YAML config, psutil memory warnings, OpenTelemetry):
+# For running tests with pytest:
+pip install -r requirements-dev.txt
+# (or: pip install -r requirements.txt pytest)
+# Optional runtime extras (YAML config, psutil memory warnings, OpenTelemetry):
 # pip install -e ".[all]"
 ```
 
@@ -80,6 +83,10 @@ All 5 offline demo scenarios passed.
 ### 3. Run the full offline test suite (failover, recovery, SSE, session isolation)
 
 ```bash
+# With pytest (installed via requirements-dev.txt):
+pytest -v
+
+# Or stdlib unittest:
 python3 -m unittest discover -s tests -v
 python3 -m unittest test_gateway_sessions.py -v
 ```
@@ -109,7 +116,7 @@ Copy [config.example.yaml](config.example.yaml) to `~/gordon-gateway/config.yaml
 | `httpx.TransportError` (`ConnectError`, `ConnectTimeout`, `ReadTimeout`, `RemoteProtocolError`, etc.) | **Retry** next backend in chain | — |
 | HTTP `5xx` (`500`–`599`), swap-in identity mismatch, malformed/non-JSON `200`, empty pre-commit SSE stream | **Retry** next backend in chain | — |
 | HTTP `4xx` (`400`, `401`, `403`, `404`, `422`, `429`, …) | **Terminal** — stop immediately and return upstream `4xx` | Opt in specific codes via `RETRYABLE_4XX_STATUSES` / `retryable_4xx_statuses` (e.g. `408,429`) |
-| Local backend -> external/cloud fallback (`trust_boundary != "local"`) | **Blocked** — never forwards prompts outside loopback | Authorize explicitly via `ALLOW_EXTERNAL_FALLBACK=true`, `EXTERNAL_FALLBACK_ROUTES`, or `allow_external_fallback: true` on the backend |
+| Local backend -> external/cloud fallback (`trust_boundary != "local"`) | **Blocked** — never forwards prompts outside loopback (`trust_boundary` is strictly validated against `"local"` / `"external"`, and `allow_external_fallback` rejects non-boolean values like `"false"`) | Authorize explicitly via `ALLOW_EXTERNAL_FALLBACK=true`, `EXTERNAL_FALLBACK_ROUTES`, or typed boolean `allow_external_fallback: true` on the backend |
 | All backends exhausted | Return typed HTTP `502` (`all_backends_failed` + `attempts`) | — |
 
 ## Protocol Capability Matrix

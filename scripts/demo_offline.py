@@ -285,6 +285,7 @@ async def run_demo() -> None:
 
         print("\nAll 5 offline demo scenarios passed.")
     finally:
+        await gateway._close_http_client()
         await primary_srv.stop()
         await backup_srv.stop()
         await walter_srv.stop()

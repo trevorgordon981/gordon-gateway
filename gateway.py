@@ -46,6 +46,7 @@ import time
 import urllib.parse
 import uuid
 from collections import Counter, OrderedDict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -920,9 +921,113 @@ def _extract_usage(data: dict) -> tuple[int, int]:
 
 
 # ===========================================================================
+# HTTP CONNECTION POOL & APP LIFESPAN
+# ===========================================================================
+_REAL_ASYNC_CLIENT = httpx.AsyncClient
+HTTP_POOL_LIMITS = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+_http_client: httpx.AsyncClient | None = None
+_http_client_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _is_async_client_patched() -> bool:
+    return httpx.AsyncClient is not _REAL_ASYNC_CLIENT
+
+
+async def _init_http_client() -> httpx.AsyncClient:
+    """Return (or lazily initialize) the shared pooled httpx.AsyncClient for the current event loop."""
+    global _http_client, _http_client_loop
+    loop = asyncio.get_running_loop()
+    if (
+        _http_client is not None
+        and not _http_client.is_closed
+        and _http_client_loop is loop
+    ):
+        return _http_client
+    if _http_client is not None and not _http_client.is_closed:
+        try:
+            await _http_client.aclose()
+        except Exception:
+            pass
+    _http_client = _REAL_ASYNC_CLIENT(timeout=DEFAULT_TIMEOUT, limits=HTTP_POOL_LIMITS)
+    _http_client_loop = loop
+    return _http_client
+
+
+async def _close_http_client() -> None:
+    """Close and clear the shared pooled httpx.AsyncClient."""
+    global _http_client, _http_client_loop
+    client = _http_client
+    _http_client = None
+    _http_client_loop = None
+    if client is not None and not client.is_closed:
+        await client.aclose()
+
+
+@asynccontextmanager
+async def _upstream_client(timeout: float | httpx.Timeout):
+    """Yield ``(client, per_request_timeout)`` for an upstream HTTP request.
+
+    In normal execution, reuses the shared pooled ``httpx.AsyncClient`` and
+    returns ``timeout`` for per-request timeout overrides. When tests monkeypatch
+    ``httpx.AsyncClient``, constructs the patched client with ``timeout=...`` and
+    yields ``per_request_timeout=None`` so lightweight test doubles work unmodified.
+    """
+    if _is_async_client_patched():
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            yield client, None
+        return
+    client = await _init_http_client()
+    yield client, timeout
+
+
+@asynccontextmanager
+async def lifespan(app_instance: FastAPI):
+    await _init_http_client()
+    _init_otel()
+    _load_state()
+    _restore_counters()
+    log.info("gordon-gateway started mode=%s port=%s tracing=%s", MODE, PORT, TRACING_ENABLED)
+
+    bg_tasks: list[asyncio.Task[Any]] = []
+    if TRACING_ENABLED:
+        async def _periodic_save():
+            while True:
+                await asyncio.sleep(STATE_SAVE_INTERVAL)
+                _save_state()
+        bg_tasks.append(asyncio.create_task(_periodic_save()))
+
+    if MODE == "walter":
+        # blockops cache janitor + catch-all passthrough route (registered last so
+        # the explicit /v1/chat/completions etc. take precedence).
+        bg_tasks.append(asyncio.create_task(cache_janitor()))
+        if not any(getattr(r, "path", None) == "/{path_info:path}" for r in app_instance.routes):
+            app_instance.add_api_route(
+                "/{path_info:path}",
+                walter_passthrough,
+                methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+            )
+
+    try:
+        yield
+    finally:
+        for task in bg_tasks:
+            task.cancel()
+        if bg_tasks:
+            await asyncio.gather(*bg_tasks, return_exceptions=True)
+        await _close_http_client()
+        _save_state()
+        if TRACING_ENABLED:
+            try:
+                _trace_provider.shutdown()
+                _metric_provider.shutdown()
+            except Exception:
+                pass
+
+
+# ===========================================================================
 # APP
 # ===========================================================================
-app = FastAPI(title=f"gordon-gateway[{MODE}]", version="1.0.0")
+app = FastAPI(title=f"gordon-gateway[{MODE}]", version="1.0.0", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -938,11 +1043,12 @@ async def health_deep():
     walter: pings the single backend root."""
     if MODE == "alfred":
         statuses: dict[str, str] = {}
-        async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT) as client:
+        async with _upstream_client(HEALTH_TIMEOUT) as (client, req_timeout):
+            extra = {"timeout": req_timeout} if req_timeout is not None else {}
             for name, backend in BACKENDS.items():
                 url = f"{backend.base_url.rstrip('/')}/models"
                 try:
-                    r = await client.get(url, headers={"Authorization": f"Bearer {backend.api_key}"})
+                    r = await client.get(url, headers={"Authorization": f"Bearer {backend.api_key}"}, **extra)
                     statuses[name] = "ok" if r.status_code < 400 else f"http_{r.status_code}"
                 except Exception as e:
                     statuses[name] = f"error_{type(e).__name__}"
@@ -950,8 +1056,9 @@ async def health_deep():
         return {"status": overall, "backends": statuses}
     # walter
     try:
-        async with httpx.AsyncClient(timeout=HEALTH_TIMEOUT) as client:
-            r = await client.get(f"{WALTER_BACKEND}/v1/models")
+        async with _upstream_client(HEALTH_TIMEOUT) as (client, req_timeout):
+            extra = {"timeout": req_timeout} if req_timeout is not None else {}
+            r = await client.get(f"{WALTER_BACKEND}/v1/models", **extra)
         return {"status": "ok" if r.status_code < 400 else "degraded", "backend": WALTER_BACKEND, "http": r.status_code}
     except Exception as e:
         return {"status": "degraded", "backend": WALTER_BACKEND, "error": type(e).__name__}
@@ -1062,8 +1169,9 @@ async def verify_swap_in_loaded(backend: Backend) -> bool:
     url = f"{backend.base_url.rstrip('/')}/models"
     ok = False
     try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            r = await client.get(url, headers={"Authorization": f"Bearer {backend.api_key}"})
+        async with _upstream_client(2.0) as (client, req_timeout):
+            extra = {"timeout": req_timeout} if req_timeout is not None else {}
+            r = await client.get(url, headers={"Authorization": f"Bearer {backend.api_key}"}, **extra)
         if r.status_code < 400:
             data = r.json().get("data") or []
             if data:
@@ -1427,11 +1535,18 @@ async def _open_upstream_sse_stream(
     """Open an upstream streaming chat response and validate at least one
     complete SSE event (or valid buffered JSON completion) BEFORE committing
     HTTP 200 downstream."""
-    client: httpx.AsyncClient | None = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
+    patched = _is_async_client_patched()
+    client: httpx.AsyncClient | None = (
+        httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) if patched else await _init_http_client()
+    )
+    owns_client = patched
     resp: httpx.Response | None = None
     try:
         url = f"{backend.base_url.rstrip('/')}/chat/completions"
-        req = client.build_request("POST", url, json=body, headers=headers)
+        req_kwargs: dict[str, Any] = {"json": body, "headers": headers}
+        if not patched:
+            req_kwargs["timeout"] = DEFAULT_TIMEOUT
+        req = client.build_request("POST", url, **req_kwargs)
         resp = await client.send(req, stream=True)
         if resp.status_code >= 400:
             text = await resp.aread()
@@ -1548,7 +1663,7 @@ async def _open_upstream_sse_stream(
                     error_type="upstream_protocol_error",
                 )
 
-            owned_client = client
+            owned_client = client if owns_client else None
             owned_resp = resp
             client = None
             resp = None
@@ -1561,7 +1676,8 @@ async def _open_upstream_sse_stream(
                         yield c
                 finally:
                     await owned_resp.aclose()
-                    await owned_client.aclose()
+                    if owned_client is not None:
+                        await owned_client.aclose()
 
             return _stream_rest()
 
@@ -1593,7 +1709,7 @@ async def _open_upstream_sse_stream(
     finally:
         if resp is not None:
             await resp.aclose()
-        if client is not None:
+        if owns_client and client is not None:
             await client.aclose()
 
 
@@ -1897,8 +2013,9 @@ async def chat_completions(request: Request, authorization: str | None = Header(
             else:
                 span = _start_chat_span(requested_model, False, raw_body, user_id, user_class, current=True)
                 try:
-                    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
-                        r = await client.post(url, json=upstream_body, headers=headers)
+                    async with _upstream_client(DEFAULT_TIMEOUT) as (client, req_timeout):
+                        extra = {"timeout": req_timeout} if req_timeout is not None else {}
+                        r = await client.post(url, json=upstream_body, headers=headers, **extra)
                     if r.status_code >= 400:
                         raise UpstreamError(
                             r.status_code,
@@ -2477,9 +2594,10 @@ async def messages(request: Request, authorization: str | None = Header(default=
             else:
                 span = _start_chat_span(requested_model, False, span_body, user_id, user_class, current=True)
                 try:
-                    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+                    async with _upstream_client(DEFAULT_TIMEOUT) as (client, req_timeout):
+                        extra = {"timeout": req_timeout} if req_timeout is not None else {}
                         url = f"{backend.base_url.rstrip('/')}/chat/completions"
-                        r = await client.post(url, json=body, headers=headers)
+                        r = await client.post(url, json=body, headers=headers, **extra)
                     if r.status_code >= 400:
                         raise UpstreamError(
                             r.status_code,
@@ -2761,8 +2879,9 @@ def _backend_for_model(model_name: str) -> str:
 
 async def purge_backend_cache():
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.delete(f"{WALTER_BACKEND}/v1/cache?type=all")
+        async with _upstream_client(10.0) as (client, req_timeout):
+            extra = {"timeout": req_timeout} if req_timeout is not None else {}
+            resp = await client.delete(f"{WALTER_BACKEND}/v1/cache?type=all", **extra)
             bolog(f"CACHE_PURGE status={resp.status_code} body={resp.content[:200]!r}")
     except Exception as e:
         bolog(f"CACHE_PURGE_ERROR {e}")
@@ -2770,8 +2889,9 @@ async def purge_backend_cache():
 
 async def get_cache_size_mb() -> float:
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{WALTER_BACKEND}/v1/cache/stats")
+        async with _upstream_client(5.0) as (client, req_timeout):
+            extra = {"timeout": req_timeout} if req_timeout is not None else {}
+            resp = await client.get(f"{WALTER_BACKEND}/v1/cache/stats", **extra)
             if resp.status_code != 200:
                 return -1
             data = resp.json()
@@ -3070,6 +3190,7 @@ def parse_tool_calls(content: str, parse_error_counts: OrderedDict[str, int] | N
             bolog(f"TOOL_PARSE_ERROR json_tc raw={raw[:100]}")
     tc_line_pattern = re.compile(r"TOOL_CALL:[ \t]*")
     tc_spans = []
+    parsed_tc_spans: list[tuple[int, int]] = []
     _decoder = json.JSONDecoder(strict=False)
     for m in tc_line_pattern.finditer(content):
         json_start = m.end()
@@ -3148,6 +3269,7 @@ def parse_tool_calls(content: str, parse_error_counts: OrderedDict[str, int] | N
             bolog(f"TOOL_PARSE_ERROR tc_line non-dict at {json_start}: {type(parsed).__name__}")
             continue
         tc_spans.append((m.start(), end_idx))
+        parsed_tc_spans.append((m.start(), end_idx))
         tool_calls.append({"id": f"call_{uuid.uuid4().hex[:8]}", "type": "function",
                            "function": {"name": parsed.get("name", ""), "arguments": json.dumps(parsed.get("arguments", {}))}})
     openclaw_pattern = re.compile(r"<(?:tool_call>\s*)?<function=(\w+)>(.*?)</function>(?:\s*</tool_call>)?", re.DOTALL)
@@ -3254,29 +3376,19 @@ def parse_tool_calls(content: str, parse_error_counts: OrderedDict[str, int] | N
             return strip_thinking("".join(out)), None
         return strip_thinking(content), None
 
-    cleaned = json_tc_pattern.sub("", content)
-    out = []
-    cursor = 0
-    for m in tc_line_pattern.finditer(cleaned):
-        json_start = m.end()
-        try:
-            _parsed, end_idx = _decoder.raw_decode(cleaned, json_start)
-        except (json.JSONDecodeError, ValueError):
-            tail = cleaned[json_start:].rstrip()
-            bare_m = re.match(r'\{\s*"([A-Za-z_][A-Za-z0-9_-]*)"\s*,', tail)
-            if not bare_m:
+    if parsed_tc_spans:
+        out = []
+        cursor = 0
+        for span_start, span_end in sorted(parsed_tc_spans):
+            if span_start < cursor:
                 continue
-            rewritten = '{"name": "' + bare_m.group(1) + '"' + tail[bare_m.end() - 1:]
-            try:
-                _parsed, end_try = _decoder.raw_decode(rewritten, 0)
-                delta = len(rewritten) - len(tail)
-                end_idx = json_start + (end_try - delta)
-            except (json.JSONDecodeError, ValueError):
-                continue
-        out.append(cleaned[cursor:m.start()])
-        cursor = end_idx
-    out.append(cleaned[cursor:])
-    cleaned = "".join(out)
+            out.append(content[cursor:span_start])
+            cursor = span_end
+        out.append(content[cursor:])
+        cleaned = "".join(out)
+    else:
+        cleaned = content
+    cleaned = json_tc_pattern.sub("", cleaned)
     cleaned = openclaw_pattern.sub("", cleaned)
     cleaned = fc_pattern.sub("", cleaned)
     cleaned = invoke_pattern.sub("", cleaned)
@@ -3310,8 +3422,9 @@ async def fetch_backend_blocking(body_bytes: bytes, headers: dict, path_qs: str,
     backend = MODEL_BACKENDS.get(alias, WALTER_BACKEND)
     url = backend + _rewrite_backend_path(path_qs)
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(700.0, connect=10.0)) as client:
-            resp = await client.post(url, headers=headers, content=body_bytes)
+        async with _upstream_client(httpx.Timeout(700.0, connect=10.0)) as (client, req_timeout):
+            extra = {"timeout": req_timeout} if req_timeout is not None else {}
+            resp = await client.post(url, headers=headers, content=body_bytes, **extra)
             return resp.content, resp.status_code
     except Exception as e:
         bolog(f"BACKEND_ERROR {e}")
@@ -3441,8 +3554,9 @@ def _walter_trace(model: str, body: bytes, in_tok: int, out_tok: int, tcc: int,
 async def _walter_passthrough_get():
     """Used by /v1/models GET in walter mode (passthrough to backend)."""
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
-            resp = await client.get(f"{WALTER_BACKEND}/v1/models")
+        async with _upstream_client(httpx.Timeout(60.0)) as (client, req_timeout):
+            extra = {"timeout": req_timeout} if req_timeout is not None else {}
+            resp = await client.get(f"{WALTER_BACKEND}/v1/models", **extra)
             return Response(content=resp.content, status_code=resp.status_code,
                             media_type=resp.headers.get("content-type", "application/json"))
     except Exception as e:
@@ -3806,8 +3920,9 @@ async def _walter_no_tools_path(request, data, headers, messages, is_session_sta
     bolog(f"INFLIGHT_INC backend={backend} count={backend_count}")
     in_tok = out_tok = 0
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
-            resp = await client.post(url, headers=headers, content=out_body)
+        async with _upstream_client(httpx.Timeout(600.0, connect=10.0)) as (client, req_timeout):
+            extra = {"timeout": req_timeout} if req_timeout is not None else {}
+            resp = await client.post(url, headers=headers, content=out_body, **extra)
             resp_bytes = resp.content
             try:
                 resp_data = json.loads(resp_bytes)
@@ -3879,9 +3994,11 @@ async def walter_passthrough(request: Request):
     headers = {k: v for k, v in request.headers.items()
                if k.lower() not in ("host", "content-length", "transfer-encoding")}
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as client:
+        async with _upstream_client(httpx.Timeout(60.0)) as (client, req_timeout):
+            extra = {"timeout": req_timeout} if req_timeout is not None else {}
             resp = await client.request(request.method, url, headers=headers,
-                                        content=body_bytes or None, params=dict(request.query_params))
+                                        content=body_bytes or None, params=dict(request.query_params),
+                                        **extra)
             ctype = resp.headers.get("content-type", "application/json")
             return Response(content=resp.content, status_code=resp.status_code, media_type=ctype)
     except Exception as e:
@@ -3904,42 +4021,6 @@ async def cache_janitor():
                 await purge_backend_cache()
         except Exception as e:
             bolog(f"JANITOR_ERROR {e}")
-
-
-# ===========================================================================
-# LIFECYCLE
-# ===========================================================================
-@app.on_event("startup")
-async def startup():
-    _init_otel()
-    _load_state()
-    _restore_counters()
-    log.info("gordon-gateway started mode=%s port=%s tracing=%s", MODE, PORT, TRACING_ENABLED)
-
-    if TRACING_ENABLED:
-        async def _periodic_save():
-            while True:
-                await asyncio.sleep(STATE_SAVE_INTERVAL)
-                _save_state()
-        asyncio.create_task(_periodic_save())
-
-    if MODE == "walter":
-        # blockops cache janitor + catch-all passthrough route (registered last so
-        # the explicit /v1/chat/completions etc. take precedence).
-        asyncio.create_task(cache_janitor())
-        app.add_api_route("/{path_info:path}", walter_passthrough,
-                          methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    _save_state()
-    if TRACING_ENABLED:
-        try:
-            _trace_provider.shutdown()
-            _metric_provider.shutdown()
-        except Exception:
-            pass
 
 
 if __name__ == "__main__":

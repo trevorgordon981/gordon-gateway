@@ -25,6 +25,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import json
 import os
@@ -1920,6 +1921,208 @@ class LegacyFunctionCallTranslationTests(unittest.IsolatedAsyncioTestCase):
                         [{"type": "tool_use", "id": "call_modern_sync", "name": "lookup", "input": {"ticker": "NVDA"}}],
                         body["content"],
                     )
+
+
+# ===========================================================================
+# GW-10: Pooled httpx.AsyncClient, FastAPI lifespan, per-request timeouts,
+#        and TOOL_CALL recovery stripping
+# ===========================================================================
+@unittest.skipUnless(_HAS_WEB_DEPS, "fastapi and httpx required")
+class ConnectionPoolAndLifespanTests(unittest.IsolatedAsyncioTestCase):
+    async def test_lifespan_initializes_reuses_pooled_client_and_closes_on_exit(self):
+        # Verify deprecated @app.on_event handlers are completely gone.
+        source = (ROOT / "gateway.py").read_text(encoding="utf-8")
+        self.assertNotIn("@app.on_event", source)
+        self.assertEqual([], list(gateway.app.router.on_startup))
+        self.assertEqual([], list(gateway.app.router.on_shutdown))
+
+        backend = gateway.Backend("local-primary", "http://127.0.0.1:9911/v1", "up-model", "k")
+        seen_timeouts: list[tuple[str, dict[str, Any] | None]] = []
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            seen_timeouts.append((request.url.path, request.extensions.get("timeout")))
+            if request.url.path.endswith("/models"):
+                return httpx.Response(200, json={"data": [{"id": "up-model"}]})
+            body = json.loads(request.content.decode("utf-8"))
+            if body.get("stream"):
+                payload = (
+                    b'data: {"id":"c-pool","model":"up-model","choices":[{"index":0,"delta":{"content":"pooled-sse"},"finish_reason":"stop"}]}\n\n'
+                    b"data: [DONE]\n\n"
+                )
+                return httpx.Response(
+                    200,
+                    headers={"content-type": "text/event-stream"},
+                    stream=_ChunkedAsyncByteStream(payload, chunk_size=32),
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-pool",
+                    "object": "chat.completion",
+                    "created": 1700000000,
+                    "model": "up-model",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "pooled-ok"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+                },
+            )
+
+        await gateway._close_http_client()
+        self.assertIsNone(gateway._http_client)
+
+        with patch.object(gateway, "MODE", "alfred"), \
+             patch.object(gateway, "MASTER_KEY", "secret"), \
+             patch.object(gateway, "BACKENDS", {"local-primary": backend}), \
+             patch.object(gateway, "FALLBACKS", {}), \
+             patch.object(gateway, "TRACING_ENABLED", False), \
+             patch.object(gateway, "verify_swap_in_loaded", AsyncMock(return_value=True)), \
+             patch.object(gateway, "_init_otel"), \
+             patch.object(gateway, "_load_state"), \
+             patch.object(gateway, "_restore_counters"), \
+             patch.object(gateway, "_save_state"):
+            async with gateway.lifespan(gateway.app):
+                pooled = gateway._http_client
+                self.assertIsNotNone(pooled)
+                assert pooled is not None
+                self.assertFalse(pooled.is_closed)
+                self.assertEqual(100, gateway.HTTP_POOL_LIMITS.max_connections)
+                self.assertEqual(20, gateway.HTTP_POOL_LIMITS.max_keepalive_connections)
+
+                # Attach a MockTransport directly to the real pooled client so we exercise
+                # the unpatched pooled code path without opening external sockets.
+                old_transport = pooled._transport
+                pooled._transport = httpx.MockTransport(_handler)
+                try:
+                    # 1) /health/deep uses HEALTH_TIMEOUT
+                    h_resp = await gateway.health_deep()
+                    self.assertEqual("ok", h_resp["status"])
+                    self.assertIs(pooled, gateway._http_client)
+
+                    # 2) Non-streaming /v1/chat/completions reuses the exact same pooled client
+                    req1 = _make_json_request(
+                        "/v1/chat/completions",
+                        {"model": "local-primary", "messages": [{"role": "user", "content": "hi"}]},
+                    )
+                    r1 = await gateway.chat_completions(req1, authorization="Bearer secret")
+                    self.assertEqual(200, r1.status_code)
+                    self.assertIs(pooled, gateway._http_client)
+
+                    # 3) Streaming /v1/messages reuses the exact same pooled client and keeps it open
+                    req2 = _make_json_request(
+                        "/v1/messages",
+                        {"model": "local-primary", "stream": True, "messages": [{"role": "user", "content": "hi"}]},
+                    )
+                    r2 = await gateway.messages(req2, authorization="Bearer secret", x_api_key=None)
+                    self.assertEqual(200, r2.status_code)
+                    sse_body = await _collect_stream(r2.body_iterator)
+                    rec = _reconstruct_anthropic_from_sse(sse_body)
+                    self.assertTrue(rec["_saw_message_stop"])
+                    self.assertEqual([{"type": "text", "text": "pooled-sse"}], rec["content"])
+                    self.assertIs(pooled, gateway._http_client)
+                    self.assertFalse(pooled.is_closed)
+                finally:
+                    await old_transport.aclose()
+
+            # Exiting lifespan must close and clear the pooled client.
+            self.assertTrue(pooled.is_closed)
+            self.assertIsNone(gateway._http_client)
+
+        self.assertEqual(3, len(seen_timeouts))
+        self.assertEqual("/v1/models", seen_timeouts[0][0])
+        self.assertEqual(gateway.HEALTH_TIMEOUT.as_dict(), seen_timeouts[0][1])
+        self.assertEqual("/v1/chat/completions", seen_timeouts[1][0])
+        self.assertEqual(gateway.DEFAULT_TIMEOUT.as_dict(), seen_timeouts[1][1])
+        self.assertEqual("/v1/chat/completions", seen_timeouts[2][0])
+        self.assertEqual(gateway.DEFAULT_TIMEOUT.as_dict(), seen_timeouts[2][1])
+
+    async def test_per_request_timeout_enforced_on_pooled_client_without_closing_pool(self):
+        attempt = 0
+
+        async def _handle_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            nonlocal attempt
+            attempt += 1
+            call_num = attempt
+            try:
+                await reader.readuntil(b"\r\n\r\n")
+                if call_num == 1:
+                    await asyncio.sleep(0.25)
+                payload = b'{"data":[{"id":"ok"}]}'
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/json\r\n"
+                    + f"Content-Length: {len(payload)}\r\n".encode("ascii")
+                    + b"Connection: close\r\n\r\n"
+                    + payload
+                )
+                await writer.drain()
+            except Exception:
+                pass
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        server = await asyncio.start_server(_handle_conn, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        backend = gateway.Backend("slow-then-fast", f"http://127.0.0.1:{port}/v1", "up", "k")
+        try:
+            with patch.object(gateway, "MODE", "alfred"), \
+                 patch.object(gateway, "BACKENDS", {"slow-then-fast": backend}), \
+                 patch.object(gateway, "TRACING_ENABLED", False), \
+                 patch.object(gateway, "HEALTH_TIMEOUT", httpx.Timeout(0.05)), \
+                 patch.object(gateway, "_init_otel"), \
+                 patch.object(gateway, "_load_state"), \
+                 patch.object(gateway, "_restore_counters"), \
+                 patch.object(gateway, "_save_state"):
+                async with gateway.lifespan(gateway.app):
+                    pooled = gateway._http_client
+                    self.assertIsNotNone(pooled)
+                    first = await gateway.health_deep()
+                    self.assertEqual("degraded", first["status"])
+                    self.assertEqual("error_ReadTimeout", first["backends"]["slow-then-fast"])
+                    self.assertIs(pooled, gateway._http_client)
+                    self.assertFalse(pooled.is_closed)
+
+                    second = await gateway.health_deep()
+                    self.assertEqual("ok", second["status"])
+                    self.assertEqual("ok", second["backends"]["slow-then-fast"])
+                    self.assertIs(pooled, gateway._http_client)
+                self.assertTrue(pooled.is_closed)
+        finally:
+            server.close()
+            await server.wait_closed()
+
+    def test_parse_tool_calls_strips_recovered_missing_args_and_truncated_braces(self):
+        # Recovery branch 3a: missing "arguments" key with trailing text
+        raw_missing_args = 'Checking host.\nTOOL_CALL: {"name": "ping", {"host": "localhost"}}\nDone.'
+        cleaned1, tcs1 = gateway.parse_tool_calls(raw_missing_args)
+        self.assertIsNotNone(tcs1)
+        self.assertEqual(1, len(tcs1))
+        self.assertEqual("ping", tcs1[0]["function"]["name"])
+        self.assertEqual({"host": "localhost"}, json.loads(tcs1[0]["function"]["arguments"]))
+        self.assertNotIn("TOOL_CALL:", cleaned1)
+        self.assertNotIn('"ping"', cleaned1)
+        self.assertIn("Checking host.", cleaned1)
+        self.assertIn("Done.", cleaned1)
+
+        # Recovery branch 3b: missing "arguments" key + missing closing brace at EOF
+        raw_missing_args_eof = 'Checking host.\nTOOL_CALL: {"name": "ping", {"host": "localhost"}'
+        cleaned1b, tcs1b = gateway.parse_tool_calls(raw_missing_args_eof)
+        self.assertIsNotNone(tcs1b)
+        self.assertEqual(1, len(tcs1b))
+        self.assertEqual("ping", tcs1b[0]["function"]["name"])
+        self.assertEqual({"host": "localhost"}, json.loads(tcs1b[0]["function"]["arguments"]))
+        self.assertEqual("Checking host.", cleaned1b)
+
+        # Recovery branch 4: truncated closing brace on standard TOOL_CALL JSON with trailing text
+        raw_truncated = 'Running lookup.\nTOOL_CALL: {"name": "lookup", "arguments": {"sym": "NVDA"}\nNext.'
+        cleaned2, tcs2 = gateway.parse_tool_calls(raw_truncated)
+        self.assertIsNotNone(tcs2)
+        self.assertEqual(1, len(tcs2))
+        self.assertEqual("lookup", tcs2[0]["function"]["name"])
+        self.assertEqual({"sym": "NVDA"}, json.loads(tcs2[0]["function"]["arguments"]))
+        self.assertNotIn("TOOL_CALL:", cleaned2)
+        self.assertNotIn("NVDA", cleaned2)
+        self.assertIn("Running lookup.", cleaned2)
+        self.assertIn("Next.", cleaned2)
 
 
 if __name__ == "__main__":

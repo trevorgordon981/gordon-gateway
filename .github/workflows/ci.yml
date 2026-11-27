@@ -19,11 +19,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install minimal test dependencies
-        run: python -m pip install --upgrade pip && pip install fastapi httpx uvicorn
+      - name: Install pinned runtime dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements.txt
       - name: Syntax check
-        run: python -m compileall -q gateway.py tests test_gateway_sessions.py
-      - name: Run offline and route tests
+        run: python -m compileall -q gateway.py scripts tests test_gateway_sessions.py
+      - name: Run offline, route, and reliability tests
         run: python -m unittest discover -s tests -v
       - name: Run session isolation tests
         run: python -m unittest test_gateway_sessions.py -v
+      - name: Run offline mock-upstream demo
+        run: python scripts/demo_offline.py

@@ -63,8 +63,8 @@ class SessionKeyTests(unittest.TestCase):
             {"role": "user", "content": "continue"},
         ]}
 
-        key1, source1 = gateway._session_key(headers, short, "trevor")
-        key2, source2 = gateway._session_key(headers, grown, "trevor")
+        key1, source1 = gateway._session_key(headers, short, "alice")
+        key2, source2 = gateway._session_key(headers, grown, "alice")
 
         self.assertEqual(key1, key2)
         self.assertEqual(source1, "x-claude-code-session-id")
@@ -73,19 +73,19 @@ class SessionKeyTests(unittest.TestCase):
         self.assertNotEqual(
             key1,
             gateway._session_key(
-                {"X-Claude-Code-Session-Id": "another-session"}, short, "trevor",
+                {"X-Claude-Code-Session-Id": "another-session"}, short, "alice",
             )[0],
         )
 
     def test_user_and_agent_both_scope_explicit_session(self):
         body = {"messages": [{"role": "user", "content": "hello"}]}
         base = {"x-claude-code-session-id": "shared-parent"}
-        parent = gateway._session_key(base, body, "trevor")[0]
+        parent = gateway._session_key(base, body, "alice")[0]
         agent = gateway._session_key(
-            {**base, "x-claude-code-agent-id": "agent-a"}, body, "trevor",
+            {**base, "x-claude-code-agent-id": "agent-a"}, body, "alice",
         )[0]
         other_agent = gateway._session_key(
-            {**base, "x-claude-code-agent-id": "agent-b"}, body, "trevor",
+            {**base, "x-claude-code-agent-id": "agent-b"}, body, "alice",
         )[0]
         other_user = gateway._session_key(base, body, "someone-else")[0]
 
@@ -96,7 +96,7 @@ class SessionKeyTests(unittest.TestCase):
             "metadata": {"session_id": "metadata-session"},
             "messages": [{"role": "user", "content": "hello"}],
         }
-        metadata_key, source = gateway._session_key({}, body, "trevor")
+        metadata_key, source = gateway._session_key({}, body, "alice")
         self.assertEqual("metadata.session_id", source)
         self.assertTrue(metadata_key.startswith("explicit:"))
 
@@ -104,15 +104,15 @@ class SessionKeyTests(unittest.TestCase):
             {"role": "system", "content": "be useful"},
             {"role": "user", "content": "root prompt"},
         ]
-        key1, source1 = gateway._session_key({}, {"messages": root}, "trevor")
+        key1, source1 = gateway._session_key({}, {"messages": root}, "alice")
         key2, _ = gateway._session_key({}, {"messages": root + [
             {"role": "assistant", "content": "answer"},
             {"role": "user", "content": "follow-up"},
-        ]}, "trevor")
+        ]}, "alice")
         key3, _ = gateway._session_key({}, {"messages": [
             {"role": "system", "content": "be useful"},
             {"role": "user", "content": "different root"},
-        ]}, "trevor")
+        ]}, "alice")
 
         self.assertEqual(key1, key2)
         self.assertNotEqual(key1, key3)

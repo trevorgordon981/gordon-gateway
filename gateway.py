@@ -13,21 +13,17 @@ ONE codebase running a modular middleware chain:
 
 Two operating MODES selected by env GATEWAY_MODE (or config `mode:`):
 
-  * "alfred"  — studio. Routing + model selection + Anthropic translation +
-                OTLP tracing. NO blockops tool-call translation / loop guards.
-                Reproduces alfred-llm-proxy (routing/translation) AND
-                metrics-proxy (tracing) behaviour.  Listen :8091 by default.
+  * "alfred"  — Multi-backend routing + model selection + Anthropic Messages
+                translation + OTLP tracing. NO blockops tool-call translation
+                or loop guards. Listen :8091 by default.
 
-  * "walter"  — laptop. blockops tool-call translation + loop guards + context
-                truncation + memory warnings + KV-cache purge, PLUS OTLP
-                tracing.  Reproduces blockops-proxy behaviour, with tracing
-                layered on.  Listen :8080 by default.
+  * "walter"  — Single/role-routed local backend with prompt-injected blockops
+                tool-call translation + loop guards + context truncation +
+                memory warnings + idle KV-cache janitor + OTLP tracing.
+                Listen :8080 by default.
 
-Framework: FastAPI + uvicorn + httpx (the stack the studio's pyenv 3.12.13
-already has, alongside opentelemetry + psutil). No new dependencies. The
-blockops parsing/loop-guard/truncation logic is framework-agnostic and is
-ported verbatim from the local blockops-proxy.py; its aiohttp HTTP handling is
-re-implemented on httpx so the whole app runs on one framework.
+Framework: FastAPI + uvicorn + httpx (with optional PyYAML, psutil, and
+OpenTelemetry). See pyproject.toml / requirements.txt for tested ranges.
 
 CONFIG: see config.example.yaml. If PyYAML is unavailable or no config file is
 present, every setting falls back to an environment variable (documented in the
@@ -40,12 +36,14 @@ import asyncio
 import datetime
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import logging.config
 import os
 import re
 import time
+import urllib.parse
 import uuid
 from collections import Counter, OrderedDict
 from dataclasses import dataclass, field
@@ -95,7 +93,7 @@ def _load_secret_env() -> None:
     one-off deployments straightforward.
     """
     path = Path(os.environ.get(
-        "GATEWAY_SECRET_ENV", os.path.expanduser("~/.hermes/.env")
+        "GATEWAY_SECRET_ENV", os.path.expanduser("~/.config/gordon-gateway/secrets.env")
     ))
     if not path.exists():
         return
@@ -180,17 +178,19 @@ _DEFAULT_PORT = 8091 if MODE == "alfred" else 8080
 PORT = _get_int("port", "PORT", _DEFAULT_PORT)
 HOST = str(_get("host", "HOST", "127.0.0.1"))
 
-# Tracing applies in BOTH modes (metrics-proxy ran on the studio; walter gets
-# tracing layered on per the unification spec). Toggle with TRACING_ENABLED.
+# Tracing applies in BOTH modes. Toggle with TRACING_ENABLED.
+# Default is metadata-only (TRACE_CONTENT=false): prompt/completion text is NOT
+# exported to OTLP unless explicitly opted in.
 TRACING_ENABLED = _get_bool("tracing_enabled", "TRACING_ENABLED", True) and _OTEL_OK
 OTEL_ENDPOINT = str(_get("otel_endpoint", "OTEL_ENDPOINT", "http://127.0.0.1:4317"))
-TRACE_CONTENT = _get_bool("trace_content", "TRACE_CONTENT", True)
+OTEL_HEADERS_RAW = str(_get("otel_headers", "OTEL_EXPORTER_OTLP_HEADERS", ""))
+TRACE_CONTENT = _get_bool("trace_content", "TRACE_CONTENT", False)
 SERVICE_NAME = str(_get("service_name", "OTEL_SERVICE_NAME", "llm-gateway"))
 
-# metrics-proxy cost + attribution config (used by trace + metrics layer)
+# Cost + attribution config (used by trace + metrics layer)
 SONNET_INPUT_PRICE = _get_float("sonnet_input_price", "SONNET_INPUT_PRICE", 15.0) / 1_000_000
 SONNET_OUTPUT_PRICE = _get_float("sonnet_output_price", "SONNET_OUTPUT_PRICE", 75.0) / 1_000_000
-PRIMARY_USER_ID = str(_get("primary_user_id", "PRIMARY_USER_ID", "U0ABVDL7C9M"))
+PRIMARY_USER_ID = str(_get("primary_user_id", "PRIMARY_USER_ID", "primary-user"))
 STATE_FILE = Path(str(_get(
     "metrics_state_file", "METRICS_STATE_FILE",
     os.path.expanduser("~/gordon-gateway/metrics_state.json"),
@@ -248,6 +248,81 @@ DEFAULT_TIMEOUT = httpx.Timeout(connect=10.0, read=600.0, write=60.0, pool=10.0)
 HEALTH_TIMEOUT = httpx.Timeout(5.0)
 
 
+def _is_loopback_host(host: str | None) -> bool:
+    if not host:
+        return False
+    cleaned = host.strip().lower().strip("[]")
+    if cleaned in ("localhost", "127.0.0.1", "::1"):
+        return True
+    try:
+        return ipaddress.ip_address(cleaned).is_loopback
+    except ValueError:
+        return False
+
+
+def _infer_trust_boundary(base_url: str) -> str:
+    parsed = urllib.parse.urlparse(base_url if "://" in base_url else f"http://{base_url}")
+    return "local" if _is_loopback_host(parsed.hostname) else "external"
+
+
+def _parse_status_code_set(raw: Any) -> frozenset[int]:
+    if raw is None or raw == "":
+        return frozenset()
+    items = raw.split(",") if isinstance(raw, str) else list(raw) if isinstance(raw, (list, tuple, set, frozenset)) else [raw]
+    codes: set[int] = set()
+    for item in items:
+        s = str(item).strip()
+        if not s:
+            continue
+        try:
+            code = int(s)
+        except ValueError:
+            continue
+        if 400 <= code < 500:
+            codes.add(code)
+    return frozenset(codes)
+
+
+def _parse_string_set(raw: Any) -> frozenset[str]:
+    if raw is None or raw == "":
+        return frozenset()
+    items = raw.split(",") if isinstance(raw, str) else list(raw) if isinstance(raw, (list, tuple, set, frozenset)) else [raw]
+    return frozenset(str(x).strip() for x in items if str(x).strip())
+
+
+# Retry & cross-boundary fallback policy:
+# - Transport/timeout/protocol failures and HTTP 5xx are retryable across the chain.
+# - HTTP 4xx statuses are TERMINAL by default unless explicitly listed in
+#   RETRYABLE_4XX_STATUSES / retryable_4xx_statuses.
+# - Crossing from a local backend to an external/cloud fallback backend requires
+#   explicit opt-in via ALLOW_EXTERNAL_FALLBACK=true, EXTERNAL_FALLBACK_ROUTES,
+#   or backend.allow_external_fallback=True.
+RETRYABLE_4XX_STATUSES: frozenset[int] = _parse_status_code_set(
+    _get("retryable_4xx_statuses", "RETRYABLE_4XX_STATUSES", "")
+)
+ALLOW_EXTERNAL_FALLBACK: bool = _get_bool(
+    "allow_external_fallback", "ALLOW_EXTERNAL_FALLBACK", False
+)
+EXTERNAL_FALLBACK_ROUTES: frozenset[str] = _parse_string_set(
+    _get("external_fallback_routes", "EXTERNAL_FALLBACK_ROUTES", "")
+)
+
+
+def is_retryable_status(
+    status_code: int,
+    retryable_4xx: frozenset[int] | set[int] | None = None,
+) -> bool:
+    """Return True if an upstream HTTP status should advance the fallback chain.
+
+    HTTP 5xx statuses are retryable by default. HTTP 4xx statuses are terminal
+    by default unless explicitly opted in via RETRYABLE_4XX_STATUSES.
+    """
+    if status_code >= 500:
+        return True
+    allowed = RETRYABLE_4XX_STATUSES if retryable_4xx is None else retryable_4xx
+    return 400 <= status_code < 500 and status_code in allowed
+
+
 @dataclass
 class Backend:
     name: str
@@ -255,39 +330,54 @@ class Backend:
     upstream_model: str
     api_key: str
     extra_headers: dict[str, str] = field(default_factory=dict)
+    trust_boundary: str = ""
+    allow_external_fallback: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.trust_boundary:
+            self.trust_boundary = _infer_trust_boundary(self.base_url)
+
+
+QWEN397B_MODEL_PATH = str(_get("qwen397b_model_path", "QWEN397B_MODEL_PATH", "qwen3.5-397b-6bit"))
+ROUTER_BASE_URL = str(_get("router_base_url", "ROUTER_BASE_URL", "http://127.0.0.1:9003/v1"))
+OPENROUTER_REFERER = str(_get("openrouter_referer", "OPENROUTER_REFERER", "http://localhost"))
 
 
 def _default_alfred_backends() -> dict[str, Backend]:
-    """The canonical alfred-llm-proxy backend table. Overridable via config
-    `backends:` (list of dicts). Defaults reproduce proxy.py exactly."""
+    """Generic default backend table for alfred mode. Overridable via config
+    `backends:` (list of dicts) or deployment-local environment variables."""
     return {
         "qwen-397b": Backend(
             name="qwen-397b",
             base_url="http://127.0.0.1:8090/v1",
-            upstream_model="/Users/alfredpennyworth/models/qwen3.5-397b-6bit",
+            upstream_model=QWEN397B_MODEL_PATH,
             api_key="not-needed",
+            trust_boundary="local",
         ),
         "kimi-k2.6": Backend(
             name="kimi-k2.6",
             base_url="http://127.0.0.1:8082/v1",
             upstream_model="kimi-k2.6",
             api_key="not-needed",
+            trust_boundary="local",
         ),
         "glm-5.1": Backend(
             name="glm-5.1",
             base_url="http://127.0.0.1:8082/v1",
             upstream_model="glm-5.1",
             api_key="not-needed",
+            trust_boundary="local",
         ),
         "glm-5.1-test": Backend(
             name="glm-5.1-test",
             base_url="http://127.0.0.1:8083/v1",
             upstream_model="glm-5.1",
             api_key="not-needed",
+            trust_boundary="local",
         ),
         "qwen-alfred-router": Backend(
             name="qwen-alfred-router",
-            base_url="http://spark-d10b:9003/v1",
+            base_url=ROUTER_BASE_URL,
             upstream_model="qwen-alfred-router",
             api_key="not-needed",
         ),
@@ -297,9 +387,10 @@ def _default_alfred_backends() -> dict[str, Backend]:
             upstream_model="nvidia/nemotron-3-super-120b-a12b:free",
             api_key=os.environ.get("OPENROUTER_API_KEY", ""),
             extra_headers={
-                "HTTP-Referer": "http://100.92.88.67",
-                "X-Title": "Alfred-Backup",
+                "HTTP-Referer": OPENROUTER_REFERER,
+                "X-Title": "gordon-gateway",
             },
+            trust_boundary="external",
         ),
     }
 
@@ -321,16 +412,18 @@ def _backends_from_config() -> dict[str, Backend]:
             upstream_model=b.get("upstream_model", b["name"]),
             api_key=api_key,
             extra_headers=b.get("extra_headers", {}) or {},
+            trust_boundary=str(b.get("trust_boundary", "") or ""),
+            allow_external_fallback=bool(b.get("allow_external_fallback", False)),
         )
     return out or _default_alfred_backends()
 
 
 BACKENDS: dict[str, Backend] = _backends_from_config() if MODE == "alfred" else {}
 
-FALLBACKS: dict[str, list[str]] = _CFG.get("fallbacks") if isinstance(_CFG.get("fallbacks"), dict) else {
-    "qwen-397b": ["openrouter-free"],
-    "qwen-alfred-router": ["openrouter-free"],
-}
+# Default fallback map is empty so local traffic never silently crosses a cloud
+# boundary. Configure `fallbacks:` in config.yaml and authorize external hops
+# explicitly via `allow_external_fallback` / `external_fallback_routes`.
+FALLBACKS: dict[str, list[str]] = _CFG.get("fallbacks") if isinstance(_CFG.get("fallbacks"), dict) else {}
 
 SWAP_IN_IDENTITY: dict[str, tuple[str, ...]] = {
     "kimi-k2.6": ("Kimi", "kimi"),
@@ -344,25 +437,24 @@ WALTER_BACKEND = str(_get("walter_backend", "BACKEND_URL", "http://127.0.0.1:808
 BACKEND_STRIP_PATH_PREFIX = str(_get("backend_strip_path_prefix", "BACKEND_STRIP_PATH_PREFIX", ""))
 _MODEL_NAME = str(_get("model_name", "MODEL_NAME", ""))
 _MODEL_DISPLAY = _MODEL_NAME or "local model"
-# walter canonical model path: an unknown/missing model id is coerced to this so
+# walter canonical model id: an unknown/missing model id is coerced to this so
 # an OpenAI-compatible backend does not cache-clear / cold-reload on an alias
-# mismatch. Studio uses Trevor's custom Python engine. Env/YAML overridable.
+# mismatch. Env/YAML overridable.
 WALTER_CANONICAL_MODEL = str(_get(
     "walter_canonical_model", "WALTER_CANONICAL_MODEL",
-    "/Users/alfredpennyworth/models/qwen3.5-122b-a10b-8bit",
+    "qwen3.5-122b-a10b-8bit",
 ))
 
-# Per-role backend overrides (studio parity). Default to WALTER_BACKEND so the
-# laptop — which serves every alias from one mlx server — keeps single-backend
-# behaviour; the studio (or any multi-server host) points these at :8083/:8084.
+# Per-role backend overrides. Default to WALTER_BACKEND so a single-server host
+# keeps single-backend behaviour; multi-server hosts can point these elsewhere.
 CODER_BACKEND = str(_get("coder_backend", "CODER_BACKEND", WALTER_BACKEND))
 REASON_BACKEND = str(_get("reason_backend", "REASON_BACKEND", WALTER_BACKEND))
 
 
 def _default_walter_aliases() -> dict[str, str]:
-    """The studio blockops MODEL_ALIASES (~8 aliases). Each maps a friendly
-    alias to the canonical backend model path so the served-model-name matches
-    what the backend expects. Mirrors ~alfredpennyworth/blockops-proxy.py."""
+    """Default walter MODEL_ALIASES (~8 aliases). Each maps a friendly alias to
+    the canonical backend model id so the served-model-name matches what the
+    backend expects."""
     canon = WALTER_CANONICAL_MODEL
     return {
         "qwen35": canon,
@@ -454,13 +546,13 @@ SESSION_PARSE_ERROR_KEYS_MAX = max(1, _get_int(
     "session_parse_error_keys_max", "SESSION_PARSE_ERROR_KEYS_MAX", 32,
 ))
 
-BLOCKOPS_LOG_FILE = str(_get("blockops_log_file", "BLOCKOPS_LOG_FILE", os.path.expanduser("~/.blockops/proxy.log")))
+BLOCKOPS_LOG_FILE = str(_get("blockops_log_file", "BLOCKOPS_LOG_FILE", os.path.expanduser("~/.gordon-gateway/blockops.log")))
 
 
 # ===========================================================================
 # LOGGING
 # ===========================================================================
-LOG_FILE = str(_get("log_file", "LOG_FILE", os.path.expanduser("~/.hermes/logs/gateway.log")))
+LOG_FILE = str(_get("log_file", "LOG_FILE", os.path.expanduser("~/.gordon-gateway/logs/gateway.log")))
 os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
 LOG_CONFIG: dict[str, Any] = {
     "version": 1,
@@ -528,17 +620,65 @@ _metric_provider = None
 _accum: dict[str, float] = {}
 
 
+def _parse_otel_headers(raw: str) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for part in (raw or "").split(","):
+        item = part.strip()
+        if not item or "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if k and v:
+            headers[k] = v
+    return headers
+
+
+def _validate_otel_transport(endpoint: str, headers_raw: str = "") -> tuple[bool, dict[str, str]]:
+    """Validate OTLP collector transport security.
+
+    Loopback collectors (127.0.0.1 / localhost / ::1) may use plaintext HTTP or
+    HTTPS. Any non-loopback collector MUST use https:// TLS (insecure=False) and
+    carry explicit authentication headers via OTEL_EXPORTER_OTLP_HEADERS.
+    """
+    ep = (endpoint or "").strip()
+    if not ep:
+        raise ValueError("OTEL_ENDPOINT must not be empty when tracing is enabled")
+    has_scheme = "://" in ep
+    parsed = urllib.parse.urlparse(ep if has_scheme else f"http://{ep}")
+    scheme = parsed.scheme.lower() if has_scheme else "http"
+    headers = _parse_otel_headers(headers_raw)
+    if _is_loopback_host(parsed.hostname):
+        insecure = scheme != "https"
+        return insecure, headers
+    if scheme != "https":
+        raise ValueError(
+            f"Non-loopback OTLP endpoint requires https:// TLS: {ep!r}"
+        )
+    auth_keys = {k.lower() for k in headers}
+    if not (auth_keys & {"authorization", "x-api-key", "api-key", "x-otlp-token"}):
+        raise ValueError(
+            f"Non-loopback OTLP endpoint requires authentication headers via "
+            f"OTEL_EXPORTER_OTLP_HEADERS (e.g. authorization=Bearer ...): {ep!r}"
+        )
+    return False, headers
+
+
 def _init_otel() -> None:
     global _tracer, _meter, _trace_provider, _metric_provider
     if not TRACING_ENABLED:
         return
+    insecure, otel_headers = _validate_otel_transport(OTEL_ENDPOINT, OTEL_HEADERS_RAW)
+    exporter_kwargs: dict[str, Any] = {"endpoint": OTEL_ENDPOINT, "insecure": insecure}
+    if otel_headers:
+        exporter_kwargs["headers"] = tuple(otel_headers.items())
     resource = Resource.create({"service.name": SERVICE_NAME})
-    metric_exporter = OTLPMetricExporter(endpoint=OTEL_ENDPOINT, insecure=True)
+    metric_exporter = OTLPMetricExporter(**exporter_kwargs)
     reader = PeriodicExportingMetricReader(metric_exporter, export_interval_millis=10_000)
     _metric_provider = MeterProvider(resource=resource, metric_readers=[reader])
     otel_metrics.set_meter_provider(_metric_provider)
 
-    span_exporter = OTLPSpanExporter(endpoint=OTEL_ENDPOINT, insecure=True)
+    span_exporter = OTLPSpanExporter(**exporter_kwargs)
     _trace_provider = TracerProvider(resource=resource)
     _trace_provider.add_span_processor(BatchSpanProcessor(span_exporter))
     otel_trace.set_tracer_provider(_trace_provider)
@@ -557,7 +697,7 @@ def _init_otel() -> None:
 def _resolve_user(headers: dict) -> tuple[str, str]:
     user_id = headers.get("x-hermes-user") or headers.get("X-Hermes-User") or ""
     if not user_id:
-        return PRIMARY_USER_ID, "primary"  # single-user: header-less traffic = primary user (Trevor)
+        return PRIMARY_USER_ID, "primary"  # single-user default: header-less traffic maps to PRIMARY_USER_ID
     if user_id == PRIMARY_USER_ID:
         return user_id, "primary"
     return user_id, "other"
@@ -741,10 +881,20 @@ async def health_deep():
 #   routing + model selection + Anthropic translation + tracing
 # ===========================================================================
 class UpstreamError(Exception):
-    def __init__(self, status: int, body: str, backend: str):
+    def __init__(
+        self,
+        status: int,
+        body: str,
+        backend: str,
+        *,
+        retryable: bool | None = None,
+        error_type: str = "upstream_error",
+    ):
         self.status = status
         self.body = body
         self.backend = backend
+        self.retryable = is_retryable_status(status) if retryable is None else retryable
+        self.error_type = error_type
         super().__init__(f"{backend} returned {status}")
 
 
@@ -765,13 +915,35 @@ def forwarded_headers(request: Request) -> dict[str, str]:
     return out
 
 
+def _external_fallback_allowed(model_name: str, candidate: Backend) -> bool:
+    return (
+        ALLOW_EXTERNAL_FALLBACK
+        or model_name in EXTERNAL_FALLBACK_ROUTES
+        or candidate.allow_external_fallback
+    )
+
+
 def resolve_chain(model_name: str) -> list[Backend]:
     if model_name not in BACKENDS:
         raise HTTPException(status_code=400, detail=f"Unknown model: {model_name}")
-    chain = [BACKENDS[model_name]]
+    primary = BACKENDS[model_name]
+    chain = [primary]
     for fb in FALLBACKS.get(model_name, []):
-        if fb in BACKENDS:
-            chain.append(BACKENDS[fb])
+        if fb not in BACKENDS:
+            continue
+        candidate = BACKENDS[fb]
+        if (
+            primary.trust_boundary == "local"
+            and candidate.trust_boundary != "local"
+            and not _external_fallback_allowed(model_name, candidate)
+        ):
+            log.warning(
+                "model=%s fallback=%s blocked: external fallback requires explicit authorization",
+                model_name,
+                fb,
+            )
+            continue
+        chain.append(candidate)
     return chain
 
 
@@ -820,90 +992,470 @@ async def verify_swap_in_loaded(backend: Backend) -> bool:
     return ok
 
 
-def parse_sse_blocks(buf: bytes) -> tuple[list[tuple[str, str]], bytes]:
+_SSE_BLOCK_SEP_RE = re.compile(rb"\r\n\r\n|\n\n|\r\n\n|\n\r\n|\r\r(?!\n|$)")
+_SSE_BLOCK_SEP_FINAL_RE = re.compile(rb"\r\n\r\n|\n\n|\r\n\n|\n\r\n|\r\r")
+_SSE_LINE_SPLIT_RE = re.compile(rb"\r\n|\n|\r")
+
+
+def parse_sse_blocks(buf: bytes, *, final: bool = False) -> tuple[list[tuple[str, str]], bytes]:
+    """Incrementally parse SSE event blocks with full LF, CRLF, and CR support.
+
+    When final=False, a trailing CR-CR sequence at the end of `buf` waits for
+    the next chunk so fragmented CRLF-CRLF delimiters are never split early.
+    """
     events: list[tuple[str, str]] = []
-    while b"\n\n" in buf:
-        block, buf = buf.split(b"\n\n", 1)
+    sep_re = _SSE_BLOCK_SEP_FINAL_RE if final else _SSE_BLOCK_SEP_RE
+    while True:
+        match = sep_re.search(buf)
+        if match is None:
+            break
+        block = buf[:match.start()]
+        buf = buf[match.end():]
         event_type = "message"
         data_parts: list[str] = []
-        for line in block.split(b"\n"):
-            line = line.rstrip(b"\r")
-            if not line or line.startswith(b":"):
+        for raw_line in _SSE_LINE_SPLIT_RE.split(block):
+            if not raw_line or raw_line.startswith(b":"):
                 continue
-            if line.startswith(b"event:"):
-                event_type = line[6:].lstrip().decode("utf-8", "replace")
-            elif line.startswith(b"data:"):
-                data_parts.append(line[5:].lstrip(b" ").decode("utf-8", "replace"))
-            elif line.startswith(b"data"):
-                data_parts.append(line[4:].lstrip(b" ").decode("utf-8", "replace"))
+            if raw_line.startswith(b"event:"):
+                event_type = raw_line[6:].strip().decode("utf-8", "replace") or "message"
+            elif raw_line.startswith(b"data:"):
+                val = raw_line[5:]
+                if val.startswith(b" "):
+                    val = val[1:]
+                data_parts.append(val.decode("utf-8", "replace"))
+            elif raw_line == b"data":
+                data_parts.append("")
         if data_parts:
             events.append((event_type, "\n".join(data_parts)))
     return events, buf
 
 
+def _has_unparsed_sse_tail(buf: bytes) -> bool:
+    """Return True if remaining bytes at EOF contain non-comment, non-blank data."""
+    if not buf:
+        return False
+    for raw_line in _SSE_LINE_SPLIT_RE.split(buf):
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith(b":"):
+            continue
+        return True
+    return False
+
+
+@dataclass
+class NormalizedCompletion:
+    id: str
+    created: int
+    model: str
+    content: str | None
+    reasoning_content: str | None
+    tool_calls: list[dict[str, Any]]
+    finish_reason: str
+    usage: dict[str, Any] | None
+
+
+def _normalize_openai_completion(obj: dict[str, Any]) -> NormalizedCompletion:
+    """Validate and normalize an OpenAI-style chat completion JSON object into
+    one shared representation used by both JSON translation and fake-SSE."""
+    if not isinstance(obj, dict):
+        raise ValueError("upstream completion must be a JSON object")
+    choices = obj.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise ValueError("upstream completion missing valid choices[0]")
+    choice = choices[0]
+    msg = choice.get("message")
+    if msg is None:
+        msg = {}
+    if not isinstance(msg, dict):
+        raise ValueError("upstream completion choices[0].message must be an object")
+
+    raw_content = msg.get("content")
+    content = raw_content if isinstance(raw_content, str) else None
+
+    raw_reasoning = msg.get("reasoning_content")
+    if not (isinstance(raw_reasoning, str) and raw_reasoning):
+        raw_reasoning = msg.get("reasoning")
+    reasoning_content = raw_reasoning if isinstance(raw_reasoning, str) and raw_reasoning else None
+
+    raw_tool_calls = msg.get("tool_calls")
+    tool_calls: list[dict[str, Any]] = []
+    if isinstance(raw_tool_calls, list):
+        for tc in raw_tool_calls:
+            if isinstance(tc, dict):
+                tool_calls.append(dict(tc))
+
+    finish_reason = choice.get("finish_reason")
+    if not isinstance(finish_reason, str) or not finish_reason:
+        finish_reason = "tool_calls" if tool_calls else "stop"
+
+    usage = obj.get("usage") if isinstance(obj.get("usage"), dict) else None
+    return NormalizedCompletion(
+        id=str(obj.get("id") or f"chatcmpl-{uuid.uuid4().hex[:12]}"),
+        created=int(obj.get("created") or int(time.time())),
+        model=str(obj.get("model") or ""),
+        content=content,
+        reasoning_content=reasoning_content,
+        tool_calls=tool_calls,
+        finish_reason=finish_reason,
+        usage=usage,
+    )
+
+
 def _json_to_fake_sse(obj: dict[str, Any]) -> bytes:
-    choice = (obj.get("choices") or [{}])[0]
-    msg = choice.get("message", {}) or {}
-    delta: dict[str, Any] = {"role": "assistant", "content": msg.get("content") or ""}
-    if msg.get("tool_calls"):
-        delta["tool_calls"] = msg["tool_calls"]
-    chunk = {
-        "id": obj.get("id", f"chatcmpl-{uuid.uuid4().hex[:12]}"),
+    """Adapt a buffered OpenAI completion JSON payload to OpenAI SSE while
+    preserving reasoning_content, content, tool_calls, finish_reason, and usage."""
+    norm = _normalize_openai_completion(obj)
+    delta: dict[str, Any] = {"role": "assistant"}
+    if norm.reasoning_content:
+        delta["reasoning_content"] = norm.reasoning_content
+    if norm.content is not None:
+        delta["content"] = norm.content
+    elif not norm.reasoning_content and not norm.tool_calls:
+        delta["content"] = ""
+    if norm.tool_calls:
+        delta["tool_calls"] = [
+            {"index": i, **tc} if "index" not in tc else dict(tc)
+            for i, tc in enumerate(norm.tool_calls)
+        ]
+    chunk: dict[str, Any] = {
+        "id": norm.id,
         "object": "chat.completion.chunk",
-        "created": obj.get("created", int(time.time())),
-        "model": obj.get("model", ""),
-        "choices": [{"index": 0, "delta": delta, "finish_reason": choice.get("finish_reason", "stop")}],
+        "created": norm.created,
+        "model": norm.model,
+        "choices": [{"index": 0, "delta": delta, "finish_reason": norm.finish_reason}],
     }
-    if "usage" in obj:
-        chunk["usage"] = obj["usage"]
+    if norm.usage is not None:
+        chunk["usage"] = norm.usage
     return b"data: " + json.dumps(chunk).encode("utf-8") + b"\n\ndata: [DONE]\n\n"
 
 
-async def _stream_upstream_chat(backend: Backend, body: dict[str, Any], headers: dict[str, str]) -> AsyncIterator[bytes]:
-    client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
+def _validate_nonstream_completion_response(r: Any, backend_name: str) -> dict[str, Any]:
+    """Validate media type, JSON syntax, and completion shape inside a backend attempt."""
+    headers = getattr(r, "headers", None) or {}
+    ctype = (headers.get("content-type") or headers.get("Content-Type") or "").lower()
+    if "text/html" in ctype:
+        raise UpstreamError(
+            502,
+            f"unexpected HTML content-type {ctype!r} from {backend_name}",
+            backend_name,
+            retryable=True,
+            error_type="upstream_protocol_error",
+        )
+    try:
+        data = r.json()
+    except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        raise UpstreamError(
+            502,
+            f"malformed JSON body from {backend_name}: {exc}",
+            backend_name,
+            retryable=True,
+            error_type="upstream_protocol_error",
+        ) from exc
+    try:
+        _normalize_openai_completion(data)
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        raise UpstreamError(
+            502,
+            f"invalid completion payload from {backend_name}: {exc}",
+            backend_name,
+            retryable=True,
+            error_type="upstream_protocol_error",
+        ) from exc
+    return data
+
+
+def _format_upstream_error_response(err: UpstreamError, *, anthropic: bool) -> JSONResponse:
+    parsed: Any = None
+    try:
+        parsed = json.loads(err.body) if err.body else None
+    except json.JSONDecodeError:
+        parsed = None
+    if anthropic:
+        if isinstance(parsed, dict) and parsed.get("type") == "error" and isinstance(parsed.get("error"), dict):
+            return JSONResponse(status_code=err.status, content=parsed)
+        msg = err.body
+        if isinstance(parsed, dict):
+            nested = parsed.get("error")
+            if isinstance(nested, dict) and nested.get("message"):
+                msg = str(nested["message"])
+            elif isinstance(parsed.get("detail"), str):
+                msg = parsed["detail"]
+        return JSONResponse(
+            status_code=err.status,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error" if 400 <= err.status < 500 else "api_error",
+                    "message": msg or f"upstream {err.backend} returned HTTP {err.status}",
+                    "backend": err.backend,
+                },
+            },
+        )
+    if isinstance(parsed, dict) and ("error" in parsed or "detail" in parsed):
+        return JSONResponse(status_code=err.status, content=parsed)
+    return JSONResponse(
+        status_code=err.status,
+        content={
+            "error": {
+                "type": err.error_type,
+                "message": err.body or f"upstream {err.backend} returned HTTP {err.status}",
+                "backend": err.backend,
+                "code": err.status,
+            }
+        },
+    )
+
+
+def _format_gateway_exhausted_response(
+    model_name: str,
+    last_err: UpstreamError | None,
+    attempts: list[dict[str, Any]],
+    *,
+    anthropic: bool,
+) -> JSONResponse:
+    detail = f"all backends failed for model={model_name}"
+    if last_err:
+        detail += f" (last: backend={last_err.backend} status={last_err.status} type={last_err.error_type})"
+    if anthropic:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "api_error",
+                    "code": "all_backends_failed",
+                    "message": detail,
+                    "attempts": attempts,
+                },
+            },
+        )
+    return JSONResponse(
+        status_code=502,
+        content={
+            "error": {
+                "type": "upstream_unavailable",
+                "code": "all_backends_failed",
+                "message": detail,
+                "attempts": attempts,
+            }
+        },
+    )
+
+
+async def _open_upstream_sse_stream(
+    backend: Backend,
+    body: dict[str, Any],
+    headers: dict[str, str],
+) -> AsyncIterator[bytes]:
+    """Open an upstream streaming chat response and validate at least one
+    complete SSE event (or valid buffered JSON completion) BEFORE committing
+    HTTP 200 downstream."""
+    client: httpx.AsyncClient | None = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
+    resp: httpx.Response | None = None
     try:
         url = f"{backend.base_url.rstrip('/')}/chat/completions"
         req = client.build_request("POST", url, json=body, headers=headers)
         resp = await client.send(req, stream=True)
-        try:
-            if resp.status_code >= 400:
-                text = await resp.aread()
-                raise UpstreamError(resp.status_code, text.decode("utf-8", "replace"), backend.name)
-            content_type = resp.headers.get("content-type", "")
-            if "text/event-stream" in content_type.lower():
-                async for chunk in resp.aiter_raw():
-                    yield chunk
-            else:
-                body_bytes = await resp.aread()
+        if resp.status_code >= 400:
+            text = await resp.aread()
+            raise UpstreamError(
+                resp.status_code,
+                text.decode("utf-8", "replace"),
+                backend.name,
+                retryable=is_retryable_status(resp.status_code),
+            )
+        content_type = (resp.headers.get("content-type") or "").lower()
+        if "text/event-stream" in content_type:
+            raw_iter = resp.aiter_raw()
+            buf = b""
+            prefetched: list[bytes] = []
+            found_valid_event = False
+            async for chunk in raw_iter:
+                if not chunk:
+                    continue
+                prefetched.append(chunk)
+                buf += chunk
+                events, buf = parse_sse_blocks(buf)
+                for _etype, data_str in events:
+                    if data_str == "[DONE]":
+                        raise UpstreamError(
+                            502,
+                            "upstream SSE stream ended with done marker before any completion event",
+                            backend.name,
+                            retryable=True,
+                            error_type="upstream_protocol_error",
+                        )
+                    try:
+                        evt = json.loads(data_str)
+                    except json.JSONDecodeError as exc:
+                        raise UpstreamError(
+                            502,
+                            f"upstream SSE stream sent malformed JSON event: {exc}",
+                            backend.name,
+                            retryable=True,
+                            error_type="upstream_protocol_error",
+                        ) from exc
+                    if not isinstance(evt, dict):
+                        raise UpstreamError(
+                            502,
+                            "upstream SSE stream event must be a JSON object",
+                            backend.name,
+                            retryable=True,
+                            error_type="upstream_protocol_error",
+                        )
+                    found_valid_event = True
+                    break
+                if found_valid_event:
+                    break
+            if not found_valid_event:
+                # Check final flush in case stream used CR-CR only without trailing chunk
+                final_events, _ = parse_sse_blocks(buf, final=True)
+                for _etype, data_str in final_events:
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        evt = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        break
+                    if isinstance(evt, dict):
+                        found_valid_event = True
+                        break
+            if not found_valid_event:
+                raise UpstreamError(
+                    502,
+                    "upstream SSE stream ended before delivering any valid event",
+                    backend.name,
+                    retryable=True,
+                    error_type="upstream_protocol_error",
+                )
+
+            owned_client = client
+            owned_resp = resp
+            client = None
+            resp = None
+
+            async def _stream_rest() -> AsyncIterator[bytes]:
                 try:
-                    obj = json.loads(body_bytes)
-                    yield _json_to_fake_sse(obj)
-                except (json.JSONDecodeError, KeyError, IndexError):
-                    yield body_bytes
-        finally:
-            await resp.aclose()
+                    for c in prefetched:
+                        yield c
+                    async for c in raw_iter:
+                        yield c
+                finally:
+                    await owned_resp.aclose()
+                    await owned_client.aclose()
+
+            return _stream_rest()
+
+        body_bytes = await resp.aread()
+        if "text/html" in content_type or (content_type and "json" not in content_type and "text/plain" not in content_type):
+            raise UpstreamError(
+                502,
+                f"unexpected content-type {content_type!r} for streaming response",
+                backend.name,
+                retryable=True,
+                error_type="upstream_protocol_error",
+            )
+        try:
+            obj = json.loads(body_bytes)
+            fake_sse = _json_to_fake_sse(obj)
+        except (json.JSONDecodeError, ValueError, KeyError, IndexError, TypeError) as exc:
+            raise UpstreamError(
+                502,
+                f"malformed buffered JSON response for stream request: {exc}",
+                backend.name,
+                retryable=True,
+                error_type="upstream_protocol_error",
+            ) from exc
+
+        async def _one_shot() -> AsyncIterator[bytes]:
+            yield fake_sse
+
+        return _one_shot()
     finally:
-        await client.aclose()
+        if resp is not None:
+            await resp.aclose()
+        if client is not None:
+            await client.aclose()
+
+
+async def _stream_upstream_chat(backend: Backend, body: dict[str, Any], headers: dict[str, str]) -> AsyncIterator[bytes]:
+    stream = await _open_upstream_sse_stream(backend, body, headers)
+    async for chunk in stream:
+        yield chunk
+
+
+def _openai_stream_error_sse(message: str) -> bytes:
+    payload = {"error": {"type": "upstream_stream_error", "message": message}}
+    return f"event: error\ndata: {json.dumps(payload)}\n\n".encode("utf-8")
 
 
 async def rewrite_stream_model(byte_iter: AsyncIterator[bytes], model_name: str) -> AsyncIterator[bytes]:
+    """Rewrite upstream OpenAI SSE chunks to the requested model name with full
+    LF/CRLF framing and strict completion/premature-EOF integrity."""
     buf = b""
-    async for chunk in byte_iter:
-        buf += chunk
-        events, buf = parse_sse_blocks(buf)
+    saw_data_event = False
+    saw_finish_reason = False
+    saw_done = False
+    stream_error: str | None = None
+
+    def _process_events(events: list[tuple[str, str]]) -> list[bytes]:
+        nonlocal saw_data_event, saw_finish_reason, saw_done, stream_error
+        out: list[bytes] = []
         for event_type, data_str in events:
             if data_str == "[DONE]":
-                yield b"data: [DONE]\n\n"
+                if not saw_data_event:
+                    stream_error = "upstream SSE stream sent done marker without completion data"
+                    return out
+                saw_done = True
+                out.append(b"data: [DONE]\n\n")
                 continue
             try:
                 obj = json.loads(data_str)
-                if isinstance(obj, dict) and "model" in obj:
-                    obj["model"] = model_name
-                payload = json.dumps(obj).encode("utf-8")
-            except json.JSONDecodeError:
-                payload = data_str.encode("utf-8")
+            except json.JSONDecodeError as exc:
+                stream_error = f"malformed JSON event in upstream SSE stream: {exc}"
+                return out
+            if not isinstance(obj, dict):
+                stream_error = "non-object JSON event in upstream SSE stream"
+                return out
+            saw_data_event = True
+            for ch in obj.get("choices") or []:
+                if isinstance(ch, dict) and ch.get("finish_reason"):
+                    saw_finish_reason = True
+            if "model" in obj:
+                obj["model"] = model_name
+            payload = json.dumps(obj).encode("utf-8")
             prefix = f"event: {event_type}\n".encode("utf-8") if event_type != "message" else b""
-            yield prefix + b"data: " + payload + b"\n\n"
+            out.append(prefix + b"data: " + payload + b"\n\n")
+        return out
+
+    try:
+        async for chunk in byte_iter:
+            if not chunk:
+                continue
+            buf += chunk
+            events, buf = parse_sse_blocks(buf)
+            for frame in _process_events(events):
+                yield frame
+            if stream_error is not None:
+                break
+    except Exception as exc:
+        stream_error = f"upstream stream interrupted ({type(exc).__name__}): {exc}"
+
+    if stream_error is None:
+        final_events, buf = parse_sse_blocks(buf, final=True)
+        for frame in _process_events(final_events):
+            yield frame
+
+    if stream_error is None:
+        if _has_unparsed_sse_tail(buf):
+            stream_error = "upstream SSE stream ended with unterminated trailing data"
+        elif not saw_data_event:
+            stream_error = "upstream SSE stream was empty"
+        elif not (saw_finish_reason or saw_done):
+            stream_error = "upstream SSE stream ended prematurely without terminal finish or done marker"
+
+    if stream_error is not None:
+        yield _openai_stream_error_sse(stream_error)
 
 
 def _alfred_models_list():
@@ -933,13 +1485,17 @@ async def _alfred_traced_stream(inner: AsyncIterator[bytes], span, model: str, s
     input_tokens = 0
     output_tokens = 0
     tool_call_count = 0
+    saw_error = False
     buf = b""
     try:
         async for chunk in inner:
             if TRACING_ENABLED:
                 buf += chunk
                 events, buf = parse_sse_blocks(buf)
-                for _etype, data_str in events:
+                for etype, data_str in events:
+                    if etype == "error":
+                        saw_error = True
+                        continue
                     if data_str == "[DONE]":
                         continue
                     try:
@@ -947,6 +1503,9 @@ async def _alfred_traced_stream(inner: AsyncIterator[bytes], span, model: str, s
                     except json.JSONDecodeError:
                         continue
                     if anthropic:
+                        if evt.get("type") == "error":
+                            saw_error = True
+                            continue
                         # Anthropic message_delta carries usage; tool_use blocks count.
                         if evt.get("type") == "content_block_start" and \
                                 evt.get("content_block", {}).get("type") == "tool_use":
@@ -956,6 +1515,9 @@ async def _alfred_traced_stream(inner: AsyncIterator[bytes], span, model: str, s
                             input_tokens = usage.get("input_tokens", input_tokens)
                             output_tokens = usage.get("output_tokens", output_tokens)
                     else:
+                        if "error" in evt and "choices" not in evt:
+                            saw_error = True
+                            continue
                         tool_call_count += _count_tool_calls_in_chunk(evt)
                         inp, out = _extract_usage(evt)
                         if inp > 0:
@@ -963,6 +1525,9 @@ async def _alfred_traced_stream(inner: AsyncIterator[bytes], span, model: str, s
                         if out > 0:
                             output_tokens = out
             yield chunk
+    except Exception:
+        saw_error = True
+        raise
     finally:
         if TRACING_ENABLED:
             duration = time.monotonic() - start
@@ -971,6 +1536,8 @@ async def _alfred_traced_stream(inner: AsyncIterator[bytes], span, model: str, s
             span.set_attribute("gen_ai.usage.total_tokens", input_tokens + output_tokens)
             span.set_attribute("gen_ai.response.tool_calls", tool_call_count)
             span.set_attribute("llm.request.duration_s", round(duration, 3))
+            if saw_error:
+                span.set_attribute("error", True)
             span.end()
             endpoint = "/v1/messages" if anthropic else "/v1/chat/completions"
             _record_metrics(input_tokens, output_tokens, tool_call_count, duration, model, endpoint, user_id, user_class)
@@ -1002,9 +1569,17 @@ async def chat_completions(request: Request, authorization: str | None = Header(
     start = time.monotonic()
 
     last_err: UpstreamError | None = None
+    attempts: list[dict[str, Any]] = []
     for backend in chain:
         if not await verify_swap_in_loaded(backend):
-            last_err = UpstreamError(503, f"{backend.name} not currently loaded on upstream (run launch-{backend.name.split('-')[0]}.sh)", backend.name)
+            last_err = UpstreamError(
+                503,
+                f"{backend.name} not currently loaded on upstream",
+                backend.name,
+                retryable=True,
+                error_type="identity_check_failed",
+            )
+            attempts.append({"backend": backend.name, "status": 503, "error_type": "identity_check_failed"})
             log.warning("rid=%s backend=%s identity_check_failed", rid, backend.name)
             continue
         upstream_body = dict(body)
@@ -1015,7 +1590,7 @@ async def chat_completions(request: Request, authorization: str | None = Header(
         upstream_body["max_tokens"] = _resolve_max_tokens(upstream_body.get("max_tokens"))
         # o11y: on streaming requests, inject stream_options.include_usage so the
         # upstream emits a final usage chunk and the trace layer records real
-        # token counts (matches what metrics-proxy did, and /v1/messages above).
+        # token counts.
         if stream:
             upstream_body["stream_options"] = {
                 **(upstream_body.get("stream_options") or {}),
@@ -1026,25 +1601,9 @@ async def chat_completions(request: Request, authorization: str | None = Header(
         log.info("rid=%s model=%s -> backend=%s stream=%s", rid, requested_model, backend.name, stream)
         try:
             if stream:
-                gen = _stream_upstream_chat(backend, upstream_body, headers)
-                first_chunk: bytes | None = None
-                try:
-                    first_chunk = await gen.__anext__()
-                except UpstreamError as e:
-                    last_err = e
-                    log.warning("rid=%s backend=%s upstream_status=%s", rid, e.backend, e.status)
-                    continue
-                except StopAsyncIteration:
-                    first_chunk = b""
-
-                async def merged(_first: bytes | None = first_chunk, _gen: AsyncIterator[bytes] = gen):
-                    if _first:
-                        yield _first
-                    async for c in _gen:
-                        yield c
-
+                upstream_iter = await _open_upstream_sse_stream(backend, upstream_body, headers)
                 span = _start_chat_span(requested_model, True, raw_body, user_id, user_class, current=False)
-                translated = rewrite_stream_model(merged(), requested_model)
+                translated = rewrite_stream_model(upstream_iter, requested_model)
                 return StreamingResponse(
                     _alfred_traced_stream(translated, span, requested_model, start, user_id, user_class, anthropic=False),
                     media_type="text/event-stream",
@@ -1052,17 +1611,18 @@ async def chat_completions(request: Request, authorization: str | None = Header(
                 )
             else:
                 span = _start_chat_span(requested_model, False, raw_body, user_id, user_class, current=True)
-                with span if TRACING_ENABLED else _NullSpan():
+                try:
                     async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
                         r = await client.post(url, json=upstream_body, headers=headers)
                     if r.status_code >= 400:
-                        last_err = UpstreamError(r.status_code, r.text, backend.name)
-                        log.warning("rid=%s backend=%s upstream_status=%s", rid, backend.name, r.status_code)
-                        if TRACING_ENABLED:
-                            span.end()
-                        continue
-                    data = r.json()
-                    if isinstance(data, dict) and "model" in data:
+                        raise UpstreamError(
+                            r.status_code,
+                            r.text,
+                            backend.name,
+                            retryable=is_retryable_status(r.status_code),
+                        )
+                    data = _validate_nonstream_completion_response(r, backend.name)
+                    if "model" in data:
                         data["model"] = requested_model
                     duration = time.monotonic() - start
                     inp, out = _extract_usage(data)
@@ -1073,18 +1633,30 @@ async def chat_completions(request: Request, authorization: str | None = Header(
                         span.set_attribute("gen_ai.usage.total_tokens", inp + out)
                         span.set_attribute("gen_ai.response.tool_calls", tcc)
                         span.set_attribute("llm.request.duration_s", round(duration, 3))
-                        span.end()
                     _record_metrics(inp, out, tcc, duration, requested_model, "/v1/chat/completions", user_id, user_class)
                     return JSONResponse(content=data, status_code=r.status_code)
-        except (httpx.ConnectError, httpx.ReadTimeout, httpx.NetworkError, httpx.RemoteProtocolError) as e:
-            last_err = UpstreamError(503, str(e), backend.name)
-            log.warning("rid=%s backend=%s connect_err=%s", rid, backend.name, type(e).__name__)
+                except Exception:
+                    if TRACING_ENABLED:
+                        span.set_attribute("error", True)
+                    raise
+                finally:
+                    if TRACING_ENABLED:
+                        span.end()
+        except UpstreamError as e:
+            attempts.append({"backend": e.backend, "status": e.status, "error_type": e.error_type})
+            if not e.retryable:
+                log.warning("rid=%s backend=%s terminal_status=%s", rid, e.backend, e.status)
+                return _format_upstream_error_response(e, anthropic=False)
+            last_err = e
+            log.warning("rid=%s backend=%s retryable_status=%s type=%s", rid, e.backend, e.status, e.error_type)
+            continue
+        except httpx.TransportError as e:
+            last_err = UpstreamError(503, str(e), backend.name, retryable=True, error_type=type(e).__name__)
+            attempts.append({"backend": backend.name, "status": 503, "error_type": type(e).__name__})
+            log.warning("rid=%s backend=%s transport_err=%s", rid, backend.name, type(e).__name__)
             continue
 
-    detail = f"all backends failed for model={requested_model}"
-    if last_err:
-        detail += f" (last: backend={last_err.backend} status={last_err.status})"
-    raise HTTPException(status_code=502, detail=detail)
+    return _format_gateway_exhausted_response(requested_model, last_err, attempts, anthropic=False)
 
 
 # --- Anthropic Messages translation (alfred) ---
@@ -1111,6 +1683,8 @@ def anthropic_to_openai_request(req: dict[str, Any]) -> dict[str, Any]:
         content = m.get("content")
         if role == "user":
             user_text_parts: list[str] = []
+            user_content_blocks: list[dict[str, Any]] = []
+            has_multimodal = False
             tool_results: list[dict[str, Any]] = []
             if isinstance(content, str):
                 user_text_parts.append(content)
@@ -1120,11 +1694,33 @@ def anthropic_to_openai_request(req: dict[str, Any]) -> dict[str, Any]:
                         continue
                     t = b.get("type")
                     if t == "text":
-                        user_text_parts.append(b.get("text", ""))
+                        txt = b.get("text", "")
+                        user_text_parts.append(txt)
+                        user_content_blocks.append({"type": "text", "text": txt})
                     elif t == "tool_result":
                         tool_results.append(b)
                     elif t == "image":
-                        user_text_parts.append("[image omitted]")
+                        source = b.get("source")
+                        if not isinstance(source, dict):
+                            raise ValueError("Anthropic image block requires a 'source' object")
+                        src_type = source.get("type")
+                        if src_type == "base64":
+                            media_type = source.get("media_type")
+                            img_data = source.get("data")
+                            if not isinstance(media_type, str) or not media_type.strip() or not isinstance(img_data, str) or not img_data:
+                                raise ValueError("Anthropic base64 image source requires non-empty 'media_type' and 'data'")
+                            image_url = f"data:{media_type.strip()};base64,{img_data}"
+                        elif src_type == "url":
+                            url_val = source.get("url")
+                            if not isinstance(url_val, str) or not url_val.strip():
+                                raise ValueError("Anthropic url image source requires non-empty 'url'")
+                            image_url = url_val.strip()
+                        else:
+                            raise ValueError(f"Unsupported Anthropic image source type: {src_type!r}")
+                        has_multimodal = True
+                        user_content_blocks.append({"type": "image_url", "image_url": {"url": image_url}})
+                    else:
+                        raise ValueError(f"Unsupported Anthropic user content block type: {t!r}")
             for tr in tool_results:
                 tr_content = tr.get("content")
                 if isinstance(tr_content, list):
@@ -1134,7 +1730,9 @@ def anthropic_to_openai_request(req: dict[str, Any]) -> dict[str, Any]:
                 else:
                     tr_text = json.dumps(tr_content)
                 msgs.append({"role": "tool", "tool_call_id": tr.get("tool_use_id", ""), "content": tr_text})
-            if user_text_parts:
+            if has_multimodal:
+                msgs.append({"role": "user", "content": user_content_blocks})
+            elif user_text_parts:
                 msgs.append({"role": "user", "content": "".join(user_text_parts)})
         elif role == "assistant":
             asst_text_parts: list[str] = []
@@ -1148,12 +1746,17 @@ def anthropic_to_openai_request(req: dict[str, Any]) -> dict[str, Any]:
                     t = b.get("type")
                     if t == "text":
                         asst_text_parts.append(b.get("text", ""))
+                    elif t == "thinking":
+                        # Assistant thinking blocks are non-functional history in OpenAI format; ignore cleanly.
+                        continue
                     elif t == "tool_use":
                         tool_calls.append({
                             "id": b.get("id", ""),
                             "type": "function",
                             "function": {"name": b.get("name", ""), "arguments": json.dumps(b.get("input", {}))},
                         })
+                    else:
+                        raise ValueError(f"Unsupported Anthropic assistant content block type: {t!r}")
             asst_msg: dict[str, Any] = {"role": "assistant", "content": "".join(asst_text_parts) if asst_text_parts else None}
             if tool_calls:
                 asst_msg["tool_calls"] = tool_calls
@@ -1166,7 +1769,7 @@ def anthropic_to_openai_request(req: dict[str, Any]) -> dict[str, Any]:
                 "parameters": t.get("input_schema", {})}}
             for t in req["tools"] if isinstance(t, dict) and "name" in t
         ]
-    if "tool_choice" in req:
+    if "tool_choice" in req and req["tool_choice"] is not None:
         tc = req["tool_choice"]
         if isinstance(tc, dict):
             tc_type = tc.get("type")
@@ -1174,8 +1777,19 @@ def anthropic_to_openai_request(req: dict[str, Any]) -> dict[str, Any]:
                 out["tool_choice"] = "auto"
             elif tc_type == "any":
                 out["tool_choice"] = "required"
+            elif tc_type == "none":
+                out["tool_choice"] = "none"
             elif tc_type == "tool":
-                out["tool_choice"] = {"type": "function", "function": {"name": tc.get("name", "")}}
+                tool_name = tc.get("name")
+                if not isinstance(tool_name, str) or not tool_name.strip():
+                    raise ValueError("Anthropic tool_choice type 'tool' requires a non-empty 'name'")
+                out["tool_choice"] = {"type": "function", "function": {"name": tool_name}}
+            else:
+                raise ValueError(f"Unsupported Anthropic tool_choice type: {tc_type!r}")
+            if tc.get("disable_parallel_tool_use") is True:
+                out["parallel_tool_calls"] = False
+        else:
+            raise ValueError(f"Unsupported Anthropic tool_choice value: {tc!r}")
     # Apply default max_tokens only when omitted/None; preserve any explicit
     # caller budget (including small values) verbatim.
     out["max_tokens"] = _resolve_max_tokens(req.get("max_tokens"))
@@ -1188,17 +1802,33 @@ def anthropic_to_openai_request(req: dict[str, Any]) -> dict[str, Any]:
     if req.get("stream"):
         out["stream"] = True
         out["stream_options"] = {"include_usage": True}
-    # Thinking control: default OFF so Slack replies are snappy on the slow local model;
-    # opt in per-message by starting a line with "think:" (case-insensitive). The trigger
-    # token is stripped before the message reaches the model. Both the top-level field and
-    # chat_template_kwargs are set (different mlx_lm versions read different ones).
+    # Thinking control: explicit Anthropic `thinking` parameter takes precedence;
+    # otherwise opt in per-message by starting a line with "think:" (case-insensitive).
     _think_on = False
-    for _m in reversed(out["messages"]):
-        if _m.get("role") == "user" and isinstance(_m.get("content"), str):
-            if re.search(r"(?im)^\s*think:\s*", _m["content"]):
-                _think_on = True
-                _m["content"] = re.sub(r"(?im)^\s*think:\s*", "", _m["content"], count=1)
-            break
+    if "thinking" in req and req["thinking"] is not None:
+        thinking_cfg = req["thinking"]
+        if isinstance(thinking_cfg, dict) and thinking_cfg.get("type") == "enabled":
+            _think_on = True
+        elif isinstance(thinking_cfg, dict) and thinking_cfg.get("type") == "disabled":
+            _think_on = False
+        else:
+            raise ValueError(f"Unsupported Anthropic thinking configuration: {thinking_cfg!r}")
+    else:
+        for _m in reversed(out["messages"]):
+            if _m.get("role") == "user":
+                mc = _m.get("content")
+                if isinstance(mc, str):
+                    if re.search(r"(?im)^\s*think:\s*", mc):
+                        _think_on = True
+                        _m["content"] = re.sub(r"(?im)^\s*think:\s*", "", mc, count=1)
+                elif isinstance(mc, list):
+                    for part in mc:
+                        if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                            if re.search(r"(?im)^\s*think:\s*", part["text"]):
+                                _think_on = True
+                                part["text"] = re.sub(r"(?im)^\s*think:\s*", "", part["text"], count=1)
+                                break
+                break
     out["enable_thinking"] = _think_on
     out["chat_template_kwargs"] = {**(out.get("chat_template_kwargs") or {}), "enable_thinking": _think_on, "thinking_mode": ("enabled" if _think_on else "disabled")}
     return out
@@ -1215,16 +1845,13 @@ _FINISH_TO_STOP = {
 
 def openai_to_anthropic_response(resp: dict[str, Any], model_name: str) -> dict[str, Any]:
     msg_id = "msg_" + uuid.uuid4().hex[:24]
-    choice = (resp.get("choices") or [{}])[0]
-    om = choice.get("message", {}) or {}
+    norm = _normalize_openai_completion(resp)
     content_blocks: list[dict[str, Any]] = []
-    reasoning_text = om.get("reasoning_content")
-    if isinstance(reasoning_text, str) and reasoning_text:
-        content_blocks.append({"type": "thinking", "thinking": reasoning_text})
-    text = om.get("content")
-    if isinstance(text, str) and text:
-        content_blocks.append({"type": "text", "text": text})
-    for tc in om.get("tool_calls", []) or []:
+    if norm.reasoning_content:
+        content_blocks.append({"type": "thinking", "thinking": norm.reasoning_content})
+    if norm.content:
+        content_blocks.append({"type": "text", "text": norm.content})
+    for tc in norm.tool_calls:
         fn = tc.get("function", {}) or {}
         try:
             args = json.loads(fn.get("arguments") or "{}")
@@ -1238,9 +1865,8 @@ def openai_to_anthropic_response(resp: dict[str, Any], model_name: str) -> dict[
         })
     if not content_blocks:
         content_blocks.append({"type": "text", "text": ""})
-    finish = choice.get("finish_reason") or "stop"
-    stop_reason = _FINISH_TO_STOP.get(finish, "end_turn")
-    usage = resp.get("usage") or {}
+    stop_reason = _FINISH_TO_STOP.get(norm.finish_reason, "end_turn")
+    usage = norm.usage or {}
     return {
         "id": msg_id, "type": "message", "role": "assistant",
         "content": content_blocks, "model": model_name,
@@ -1254,8 +1880,13 @@ def _sse(event: str, data: dict[str, Any]) -> bytes:
 
 
 async def openai_stream_to_anthropic(byte_iter: AsyncIterator[bytes], model_name: str) -> AsyncIterator[bytes]:
+    """Translate an OpenAI SSE byte stream to Anthropic Messages SSE with full
+    LF/CRLF framing and distinct success vs error finalization."""
     msg_id = "msg_" + uuid.uuid4().hex[:24]
     started = False
+    saw_finish_reason = False
+    saw_done = False
+    stream_error: str | None = None
     text_block_open = False
     text_block_idx = -1
     reasoning_block_open = False
@@ -1266,56 +1897,73 @@ async def openai_stream_to_anthropic(byte_iter: AsyncIterator[bytes], model_name
     input_tokens = 0
     output_tokens = 0
     buf = b""
-    async for chunk in byte_iter:
-        buf += chunk
-        events, buf = parse_sse_blocks(buf)
+
+    def _process_events(events: list[tuple[str, str]]) -> list[bytes]:
+        nonlocal started, saw_finish_reason, saw_done, stream_error
+        nonlocal text_block_open, text_block_idx, reasoning_block_open, reasoning_block_idx
+        nonlocal next_block_idx, stop_reason, input_tokens, output_tokens
+        out: list[bytes] = []
         for _event_type, data_str in events:
             if data_str == "[DONE]":
+                if not started:
+                    stream_error = "upstream SSE stream sent done marker without completion data"
+                    return out
+                saw_done = True
                 continue
             try:
                 evt = json.loads(data_str)
-            except json.JSONDecodeError:
-                continue
+            except json.JSONDecodeError as exc:
+                stream_error = f"malformed JSON event in upstream SSE stream: {exc}"
+                return out
+            if not isinstance(evt, dict):
+                stream_error = "non-object JSON event in upstream SSE stream"
+                return out
             if not started:
                 started = True
-                yield _sse("message_start", {"type": "message_start", "message": {
+                out.append(_sse("message_start", {"type": "message_start", "message": {
                     "id": msg_id, "type": "message", "role": "assistant", "content": [],
                     "model": model_name, "stop_reason": None, "stop_sequence": None,
-                    "usage": {"input_tokens": 0, "output_tokens": 0}}})
+                    "usage": {"input_tokens": 0, "output_tokens": 0}}}))
             usage_chunk = evt.get("usage")
-            if usage_chunk:
+            if isinstance(usage_chunk, dict):
                 input_tokens = usage_chunk.get("prompt_tokens", input_tokens)
                 output_tokens = usage_chunk.get("completion_tokens", output_tokens)
             choices = evt.get("choices") or []
             if not choices:
                 continue
             ch = choices[0]
+            if not isinstance(ch, dict):
+                continue
             delta = ch.get("delta") or {}
             finish = ch.get("finish_reason")
             reasoning_delta = delta.get("reasoning_content")
+            if not (isinstance(reasoning_delta, str) and reasoning_delta):
+                reasoning_delta = delta.get("reasoning")
             if isinstance(reasoning_delta, str) and reasoning_delta:
                 if not reasoning_block_open:
                     reasoning_block_idx = next_block_idx
                     next_block_idx += 1
-                    yield _sse("content_block_start", {"type": "content_block_start", "index": reasoning_block_idx,
-                                                       "content_block": {"type": "thinking", "thinking": ""}})
+                    out.append(_sse("content_block_start", {"type": "content_block_start", "index": reasoning_block_idx,
+                                                            "content_block": {"type": "thinking", "thinking": ""}}))
                     reasoning_block_open = True
-                yield _sse("content_block_delta", {"type": "content_block_delta", "index": reasoning_block_idx,
-                                                   "delta": {"type": "thinking_delta", "thinking": reasoning_delta}})
+                out.append(_sse("content_block_delta", {"type": "content_block_delta", "index": reasoning_block_idx,
+                                                        "delta": {"type": "thinking_delta", "thinking": reasoning_delta}}))
             content = delta.get("content")
-            if content:
+            if isinstance(content, str) and content:
                 if reasoning_block_open:
-                    yield _sse("content_block_stop", {"type": "content_block_stop", "index": reasoning_block_idx})
+                    out.append(_sse("content_block_stop", {"type": "content_block_stop", "index": reasoning_block_idx}))
                     reasoning_block_open = False
                 if not text_block_open:
                     text_block_idx = next_block_idx
                     next_block_idx += 1
-                    yield _sse("content_block_start", {"type": "content_block_start", "index": text_block_idx,
-                                                       "content_block": {"type": "text", "text": ""}})
+                    out.append(_sse("content_block_start", {"type": "content_block_start", "index": text_block_idx,
+                                                            "content_block": {"type": "text", "text": ""}}))
                     text_block_open = True
-                yield _sse("content_block_delta", {"type": "content_block_delta", "index": text_block_idx,
-                                                   "delta": {"type": "text_delta", "text": content}})
+                out.append(_sse("content_block_delta", {"type": "content_block_delta", "index": text_block_idx,
+                                                        "delta": {"type": "text_delta", "text": content}}))
             for tc in delta.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
                 tc_idx_raw = tc.get("index")
                 if tc_idx_raw is not None:
                     tc_key: Any = tc_idx_raw
@@ -1325,38 +1973,68 @@ async def openai_stream_to_anthropic(byte_iter: AsyncIterator[bytes], model_name
                     tc_key = f"_synth_{len(tool_blocks)}"
                 if tc_key not in tool_blocks:
                     if reasoning_block_open:
-                        yield _sse("content_block_stop", {"type": "content_block_stop", "index": reasoning_block_idx})
+                        out.append(_sse("content_block_stop", {"type": "content_block_stop", "index": reasoning_block_idx}))
                         reasoning_block_open = False
                     if text_block_open:
-                        yield _sse("content_block_stop", {"type": "content_block_stop", "index": text_block_idx})
+                        out.append(_sse("content_block_stop", {"type": "content_block_stop", "index": text_block_idx}))
                         text_block_open = False
                     block_idx = next_block_idx
                     next_block_idx += 1
                     tc_id = tc.get("id") or f"toolu_{uuid.uuid4().hex[:24]}"
                     tc_name = (tc.get("function") or {}).get("name", "") or ""
                     tool_blocks[tc_key] = {"block_idx": block_idx, "id": tc_id, "name": tc_name, "args": ""}
-                    yield _sse("content_block_start", {"type": "content_block_start", "index": block_idx,
-                               "content_block": {"type": "tool_use", "id": tc_id, "name": tc_name, "input": {}}})
+                    out.append(_sse("content_block_start", {"type": "content_block_start", "index": block_idx,
+                                    "content_block": {"type": "tool_use", "id": tc_id, "name": tc_name, "input": {}}}))
                 fn = tc.get("function") or {}
                 if fn.get("name") and not tool_blocks[tc_key]["name"]:
                     tool_blocks[tc_key]["name"] = fn["name"]
                 if fn.get("arguments"):
                     tool_blocks[tc_key]["args"] += fn["arguments"]
-                    yield _sse("content_block_delta", {"type": "content_block_delta",
-                               "index": tool_blocks[tc_key]["block_idx"],
-                               "delta": {"type": "input_json_delta", "partial_json": fn["arguments"]}})
+                    out.append(_sse("content_block_delta", {"type": "content_block_delta",
+                                    "index": tool_blocks[tc_key]["block_idx"],
+                                    "delta": {"type": "input_json_delta", "partial_json": fn["arguments"]}}))
             if finish:
+                saw_finish_reason = True
                 stop_reason = _FINISH_TO_STOP.get(finish, "end_turn")
+        return out
+
+    try:
+        async for chunk in byte_iter:
+            if not chunk:
+                continue
+            buf += chunk
+            events, buf = parse_sse_blocks(buf)
+            for frame in _process_events(events):
+                yield frame
+            if stream_error is not None:
+                break
+    except Exception as exc:
+        stream_error = f"upstream stream interrupted ({type(exc).__name__}): {exc}"
+
+    if stream_error is None:
+        final_events, buf = parse_sse_blocks(buf, final=True)
+        for frame in _process_events(final_events):
+            yield frame
+
+    if stream_error is None:
+        if _has_unparsed_sse_tail(buf):
+            stream_error = "upstream SSE stream ended with unterminated trailing data"
+        elif not started:
+            stream_error = "upstream SSE stream was empty"
+        elif not (saw_finish_reason or saw_done):
+            stream_error = "upstream SSE stream ended prematurely without finish marker"
+
+    if stream_error is not None:
+        # Distinct error finalization: NEVER emit message_delta/end_turn or message_stop.
+        yield _sse("error", {"type": "error", "error": {"type": "api_error", "message": stream_error}})
+        return
+
     if reasoning_block_open:
         yield _sse("content_block_stop", {"type": "content_block_stop", "index": reasoning_block_idx})
     if text_block_open:
         yield _sse("content_block_stop", {"type": "content_block_stop", "index": text_block_idx})
     for tb in tool_blocks.values():
         yield _sse("content_block_stop", {"type": "content_block_stop", "index": tb["block_idx"]})
-    if not started:
-        yield _sse("message_start", {"type": "message_start", "message": {
-            "id": msg_id, "type": "message", "role": "assistant", "content": [], "model": model_name,
-            "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})
     yield _sse("message_delta", {"type": "message_delta",
                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
                "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens}})
@@ -1385,18 +2063,32 @@ async def messages(request: Request, authorization: str | None = Header(default=
         raise HTTPException(status_code=400, detail="model is required")
     stream = bool(a_req.get("stream"))
     rid = uuid.uuid4().hex[:8]
-    o_req = anthropic_to_openai_request(a_req)
+    try:
+        o_req = anthropic_to_openai_request(a_req)
+    except ValueError as e:
+        return JSONResponse(
+            status_code=400,
+            content={"type": "error", "error": {"type": "invalid_request_error", "message": str(e)}},
+        )
     chain = resolve_chain(requested_model)
     headers_in = dict(request.headers)
     user_id, user_class = _resolve_user(headers_in)
     start = time.monotonic()
-    # span prompt summary uses the OpenAI-shaped body so it matches metrics-proxy.
+    # span prompt summary uses the OpenAI-shaped body so it stays uniform.
     span_body = json.dumps(o_req).encode("utf-8")
 
     last_err: UpstreamError | None = None
+    attempts: list[dict[str, Any]] = []
     for backend in chain:
         if not await verify_swap_in_loaded(backend):
-            last_err = UpstreamError(503, f"{backend.name} not currently loaded on upstream (run launch-{backend.name.split('-')[0]}.sh)", backend.name)
+            last_err = UpstreamError(
+                503,
+                f"{backend.name} not currently loaded on upstream",
+                backend.name,
+                retryable=True,
+                error_type="identity_check_failed",
+            )
+            attempts.append({"backend": backend.name, "status": 503, "error_type": "identity_check_failed"})
             log.warning("rid=%s backend=%s identity_check_failed", rid, backend.name)
             continue
         body = dict(o_req)
@@ -1405,24 +2097,9 @@ async def messages(request: Request, authorization: str | None = Header(default=
         log.info("rid=%s anthropic model=%s -> backend=%s stream=%s", rid, requested_model, backend.name, stream)
         try:
             if stream:
-                gen = _stream_upstream_chat(backend, body, headers)
-                try:
-                    first_chunk: bytes | None = await gen.__anext__()
-                except UpstreamError as e:
-                    last_err = e
-                    log.warning("rid=%s backend=%s upstream_status=%s", rid, e.backend, e.status)
-                    continue
-                except StopAsyncIteration:
-                    first_chunk = b""
-
-                async def merged(_first: bytes | None = first_chunk, _gen: AsyncIterator[bytes] = gen):
-                    if _first:
-                        yield _first
-                    async for c in _gen:
-                        yield c
-
+                upstream_iter = await _open_upstream_sse_stream(backend, body, headers)
                 span = _start_chat_span(requested_model, True, span_body, user_id, user_class, current=False)
-                translated = openai_stream_to_anthropic(merged(), requested_model)
+                translated = openai_stream_to_anthropic(upstream_iter, requested_model)
                 return StreamingResponse(
                     _alfred_traced_stream(translated, span, requested_model, start, user_id, user_class, anthropic=True),
                     media_type="text/event-stream",
@@ -1430,17 +2107,18 @@ async def messages(request: Request, authorization: str | None = Header(default=
                 )
             else:
                 span = _start_chat_span(requested_model, False, span_body, user_id, user_class, current=True)
-                with span if TRACING_ENABLED else _NullSpan():
+                try:
                     async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
                         url = f"{backend.base_url.rstrip('/')}/chat/completions"
                         r = await client.post(url, json=body, headers=headers)
                     if r.status_code >= 400:
-                        last_err = UpstreamError(r.status_code, r.text, backend.name)
-                        log.warning("rid=%s backend=%s upstream_status=%s", rid, backend.name, r.status_code)
-                        if TRACING_ENABLED:
-                            span.end()
-                        continue
-                    oai = r.json()
+                        raise UpstreamError(
+                            r.status_code,
+                            r.text,
+                            backend.name,
+                            retryable=is_retryable_status(r.status_code),
+                        )
+                    oai = _validate_nonstream_completion_response(r, backend.name)
                     a_resp = openai_to_anthropic_response(oai, requested_model)
                     duration = time.monotonic() - start
                     inp, out = _extract_usage(oai)
@@ -1451,18 +2129,30 @@ async def messages(request: Request, authorization: str | None = Header(default=
                         span.set_attribute("gen_ai.usage.total_tokens", inp + out)
                         span.set_attribute("gen_ai.response.tool_calls", tcc)
                         span.set_attribute("llm.request.duration_s", round(duration, 3))
-                        span.end()
                     _record_metrics(inp, out, tcc, duration, requested_model, "/v1/messages", user_id, user_class)
                     return JSONResponse(content=a_resp)
-        except (httpx.ConnectError, httpx.ReadTimeout, httpx.NetworkError, httpx.RemoteProtocolError) as e:
-            last_err = UpstreamError(503, str(e), backend.name)
-            log.warning("rid=%s backend=%s connect_err=%s", rid, backend.name, type(e).__name__)
+                except Exception:
+                    if TRACING_ENABLED:
+                        span.set_attribute("error", True)
+                    raise
+                finally:
+                    if TRACING_ENABLED:
+                        span.end()
+        except UpstreamError as e:
+            attempts.append({"backend": e.backend, "status": e.status, "error_type": e.error_type})
+            if not e.retryable:
+                log.warning("rid=%s backend=%s terminal_status=%s", rid, e.backend, e.status)
+                return _format_upstream_error_response(e, anthropic=True)
+            last_err = e
+            log.warning("rid=%s backend=%s retryable_status=%s type=%s", rid, e.backend, e.status, e.error_type)
+            continue
+        except httpx.TransportError as e:
+            last_err = UpstreamError(503, str(e), backend.name, retryable=True, error_type=type(e).__name__)
+            attempts.append({"backend": backend.name, "status": 503, "error_type": type(e).__name__})
+            log.warning("rid=%s backend=%s transport_err=%s", rid, backend.name, type(e).__name__)
             continue
 
-    detail = f"all backends failed for model={requested_model}"
-    if last_err:
-        detail += f" (last: backend={last_err.backend} status={last_err.status})"
-    raise HTTPException(status_code=502, detail=detail)
+    return _format_gateway_exhausted_response(requested_model, last_err, attempts, anthropic=True)
 
 
 @app.post("/v1/messages/count_tokens")
@@ -1476,7 +2166,13 @@ async def count_tokens(request: Request, authorization: str | None = Header(defa
     a_req = await read_json_body(request)
     if not isinstance(a_req, dict):
         raise HTTPException(status_code=400, detail="body must be a JSON object")
-    o_req = anthropic_to_openai_request(a_req)
+    try:
+        o_req = anthropic_to_openai_request(a_req)
+    except ValueError as e:
+        return JSONResponse(
+            status_code=400,
+            content={"type": "error", "error": {"type": "invalid_request_error", "message": str(e)}},
+        )
     payload = json.dumps({"messages": o_req.get("messages", []), "tools": o_req.get("tools", [])})
     estimate = max(1, len(payload) // 4)
     return {"input_tokens": estimate}
@@ -2409,7 +3105,26 @@ async def walter_handle(request: Request):
     messages = data.get("messages", [])
     client_message_count = len(messages)
     tools = data.pop("tools", None)
-    data.pop("tool_choice", None)
+    tool_choice = data.pop("tool_choice", None)
+    if tool_choice is not None:
+        if tool_choice == "none" or (isinstance(tool_choice, dict) and tool_choice.get("type") == "none"):
+            # Explicit no-tool semantics: suppress tool prompt injection and route
+            # through the direct no-tools path.
+            tools = None
+        elif tool_choice == "auto" or (isinstance(tool_choice, dict) and tool_choice.get("type") == "auto"):
+            pass
+        else:
+            bolog(f"UNSUPPORTED_TOOL_CHOICE value={tool_choice!r}")
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": "unsupported_tool_choice",
+                        "message": f"Walter prompt-injected tool mode supports tool_choice 'auto' or 'none'; got {tool_choice!r}",
+                    }
+                },
+            )
 
     requested_backend = _backend_for_model(data.get("model", ""))
     backend_inflight = _get_inflight(requested_backend)

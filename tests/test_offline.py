@@ -117,16 +117,16 @@ class SessionIdentity(unittest.TestCase):
     def test_explicit_session_is_stable_scoped_and_opaque(self):
         key = self.ns["_session_key"]
         body = {"messages": [{"role": "user", "content": "hello"}]}
-        one, source = key({"X-Claude-Code-Session-Id": "secret-id"}, body, "trevor")
+        one, source = key({"X-Claude-Code-Session-Id": "secret-id"}, body, "alice")
         grown, _ = key(
             {"X-Claude-Code-Session-Id": "secret-id"},
             {"messages": body["messages"] + [{"role": "assistant", "content": "hi"}]},
-            "trevor",
+            "alice",
         )
         agent, _ = key(
             {"X-Claude-Code-Session-Id": "secret-id", "X-Claude-Code-Agent-Id": "agent-a"},
             body,
-            "trevor",
+            "alice",
         )
         self.assertEqual(one, grown)
         self.assertNotEqual(one, agent)
@@ -136,9 +136,9 @@ class SessionIdentity(unittest.TestCase):
     def test_fallback_root_survives_conversation_growth(self):
         key = self.ns["_session_key"]
         root = [{"role": "system", "content": "be useful"}, {"role": "user", "content": "root"}]
-        one, source = key({}, {"messages": root}, "trevor")
-        grown, _ = key({}, {"messages": root + [{"role": "assistant", "content": "answer"}]}, "trevor")
-        different, _ = key({}, {"messages": [{"role": "user", "content": "other"}]}, "trevor")
+        one, source = key({}, {"messages": root}, "alice")
+        grown, _ = key({}, {"messages": root + [{"role": "assistant", "content": "answer"}]}, "alice")
+        different, _ = key({}, {"messages": [{"role": "user", "content": "other"}]}, "alice")
         self.assertEqual(one, grown)
         self.assertNotEqual(one, different)
         self.assertEqual("conversation-root", source)
